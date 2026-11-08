@@ -1,0 +1,4 @@
+- insert:
+    - id: engine-switch
+      name: '@local/dsh-engine-switch'
+      config: {}

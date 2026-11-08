@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Credentials and local state
+.pi-agent/
+
+# Rollback and backup artifacts
+.rollback-snapshots/
+.local-backups/
+*.bak
+*.bak-*
+*.bak2
+*.orig
+*.backup-*
+
+# Patch files (but keep .yml patches like cordis.patch.yml)
+*.patch
+
+# Evidence documents
+*-EVIDENCE.md
+SMOKE-EVIDENCE.md
+
+# System files
+.DS_Store
+
+# Pi runtime local state (contains credentials)
+.pi-home/
+.pi*/

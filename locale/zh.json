@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "引擎接管外挂",
+    "description": "字段接管 ctx.agents.factory 槽位并按会话分流：未打 marker 的会话原样走原生 AgentLoop，打了 marker 的会话交给外挂引擎。"
+  }
+}

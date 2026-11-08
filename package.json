@@ -1,0 +1,31 @@
+{
+  "name": "@local/dsh-engine-switch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dependencies": {
+    "@botiverse/oar": "^0.95.0",
+    "@deepseek-ai/schemastery": "file:/Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-src/dsh/node_modules/@deepseek-ai/schemastery",
+    "@deepseek-ai/cordis": "file:/Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-src/dsh/node_modules/@deepseek-ai/cordis",
+    "@deepseek-ai/dsh-agent": "file:/Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-src/dsh/node_modules/@deepseek-ai/dsh-agent",
+    "@deepseek-ai/dsh-llm": "file:/Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-src/dsh/node_modules/@deepseek-ai/dsh-llm",
+    "@deepseek-ai/dsh-session": "file:/Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-src/dsh/node_modules/@deepseek-ai/dsh-session",
+    "@deepseek-ai/dsh-agent-loop": "file:/Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-src/dsh/node_modules/@deepseek-ai/dsh-agent-loop"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

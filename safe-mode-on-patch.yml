@@ -1,0 +1,5 @@
+- insert:
+  - id: engine-switch-safe-on
+    name: ./index.js
+    config:
+      evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject/safe-mode-on-evidence.json

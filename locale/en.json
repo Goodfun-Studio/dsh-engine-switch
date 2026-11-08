@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Engine Switch",
+    "description": "Takes over the ctx.agents.factory slot and routes sessions: unmarked sessions keep the native AgentLoop, marked sessions go to a pluggable external engine."
+  }
+}

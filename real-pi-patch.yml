@@ -1,0 +1,26 @@
+# 注入用 patch：把 dsh-engine-switch 外挂插进真实 DSH profile 的装配树，
+# 并把主会话引擎**强制**切到 pi（forceEngine: 'pi'）。
+#
+# 用法（endo-pi.sh 自动执行，参数顺序已实测确认）：
+#   DSH_HOME=<workspace>/.recon/dsh-test-home \
+#     node <dsh>/lib/bin.js testh --patch <this-patch> "<task>"
+#   反例（会报 unknown option '--patch'）：testh "<task>" --patch <this-patch>
+#
+# 关键点：
+#   · `insert.name` 的相对路径是**相对补丁文件目录**解析的，故 ./index.js 指本目录插件。
+#   · forceEngine: 'pi' → 路由器忽略 marker，把所有 create/resume 一律交给 pi 引擎。
+#   · pi.agentDir 指向工作区内已播种的 .pi-agent（pi 子进程缺它会因写锁文件 EPERM 直接崩）。
+- insert:
+    - id: engine-switch-real-pi
+      name: ./index.js
+      config:
+        evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject/real-pi-evidence.json
+        forceEngine: pi
+        pi:
+          agentDir: /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch/.pi-agent
+          prompt: "reply with exactly: CONFIG_FALLBACK"
+          timeoutMs: 45000
+          provider: magpie
+          model: auto/deepseek-v4.1-flash
+          cliPath: /Users/ivywu/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+          cwd: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject

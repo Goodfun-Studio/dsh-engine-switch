@@ -1,0 +1,16 @@
+# 注入用 patch：把 dsh-engine-switch 外挂插进真实 DSH profile 的装配树。
+#
+# 用法（endo.sh 自动生成运行时副本到 .recon/dsh-real-inject/patch-real-takeover.yml，
+# 其中 name / evidencePath 写绝对路径；此处保留同一插件的相对路径参考形态）：
+#
+#   DSH_HOME=<workspace>/.recon/dsh-test-home \
+#     node <dsh>/lib/bin.js testh "<task>" --patch <this-or-generated-patch>
+#
+# 关键点：`insert` 行里的相对路径是**相对补丁文件目录**解析的，所以外挂不必装进
+# 任何 profile、不必进 node_modules，用路径即可被真实 Loader 加载（见
+# dsh-app-boot 的 anchorInsertedPluginNames）。
+- insert:
+    - id: engine-switch-real
+      name: ./index.js
+      config:
+        evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject/real-takeover-evidence.json
