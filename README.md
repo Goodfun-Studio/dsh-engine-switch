@@ -52,21 +52,53 @@ plugin_manager install_bundle
   `package-lock.json` 只应在**干净环境**（无本地软链）用 `npm install --package-lock-only` 重算，
   或直接 `npm ci` 按 lock 从 registry 装（该 lock 已与宿主同版本：0.2.2-rc.1 / cordis 4.1.0 / schemastery 3.19.0）。
 
-## 如何选引擎
+## 如何选引擎（Engine ⊥ Preset）
 
-两条路都已可用：
+**先分清两个正交维度**（混在一起就是上一轮的坑）：
 
-1. **按 agentPreset 自动路由**：create/resume 带 `options.meta.agentPreset`，且其值等于
-   `config.piPreset`（默认 `'pi'`）时，本次调用交给 pi 引擎；缺失、非字符串、空串或为别的值
-   （如 `'standard'`）一律走原生 target（负向防误杀，可复跑见 `preset-routing.mjs` / `preset-routing.sh`）。
-2. **强制全局引擎**：`cordis.patch.yml` 的 `config.forceEngine` 字段（如 `pi`）。
+| 维度 | 决定什么 | 在哪选 |
+| --- | --- | --- |
+| **Agent Preset**（业务预设） | 系统提示词模板 / 角色 / 工具插件集 | 新建任务页的预设 chip（原生四种：标准 / PTC / 极简 / 创造） |
+| **Engine**（底座引擎） | 底座由谁驱动：DSH 原生 AgentLoop / OAR 驱动的 pi / 回声 | `/engine` 命令、插件设置字段 `engine`、或请求 marker |
 
-优先级：`forceEngine` > `agentPreset` > pi marker > echo marker > 原生 target。
+所以「Pi 引擎」**不在**预设下拉框里（`cordis.patch.yml` 里不再声明任何 preset）。
+引擎走自己的入口，三个都可用：
 
-**尚未实现的功能**：
-- **按会话选引擎**：根据会话创建时的其他参数（非 agentPreset）动态选择引擎
+1. **斜杠命令**（输入区域，推荐）：
+   ```
+   /engine            # 看当前选择器值 / 本会话引擎 / 可选值
+   /engine pi         # 切到 Pi 引擎
+   /engine native     # 切回原生
+   /engine echo       # 回声替身（只回显固定文本，不起模型；联调用）
+   ```
+2. **插件设置字段**：`engine` 是 volatile 字段，设置面（设置页 / 插件页）里可以改，改完**即时生效**并写回 profile patch。
+3. **请求级 marker**（headless / ACP / 脚本按次钉死）：`options.meta.engine` 或 `options.engine`，取值 `native` / `pi` / `echo`。
 
-这些特性计划在后续版本中实现。
+**判定优先级**（高 → 低，逐条可测，见 `engine-selector.mjs`）：
+
+```
+forceEngine > 请求 marker > 会话已绑定引擎 > agentPreset 兼容命中 > config.engine > 原生 target
+```
+
+- `forceEngine`：运维/测试硬开关（`cordis.patch.yml` 的 `config.forceEngine`），命中已知引擎时忽略其余判据。
+- **请求 marker**：一次 create/resume 自带的意图，压过一切非强制来源。
+- **会话已绑定引擎**：某会话第一次落在哪个引擎就记住它（进程内），之后同一会话的 resume 跟随它 ——
+  会话身份 ≥ 全局缺省，和 DSH 自己的「会话记下的模型压过默认模型」同款。
+- **agentPreset 兼容命中**：`options.meta.agentPreset === config.piPreset`（缺省 `'pi'`）→ pi 引擎。
+  这是**给存量会话留的兼容判据**（改造前已建、header 里记着 `agentPreset: pi` 的会话），不是引擎的定义，也不再向 UI 暴露任何 pi preset。
+- **`config.engine`**：独立选择器的值（`/engine` 与设置页改的就是它）。
+- 全部不命中 → 原样委托原生 target。
+
+**负向防误杀**：任何来源里引擎取值不作数时（`'PI'` / `'pi '` / `'pi-lite'` / `'auto'` / 空串 / null /
+非字符串）该来源直接跳过；`agentPreset` 缺失或为别的值（如 `'standard'`）时兼容命中为 false。
+
+**语义边界（如实说明）**：DSH 在「新建任务」那一刻就把 Agent 建好了（preset 之所以能改，是因为它有一等公民的
+`agentPresets/select` remote 做活体换装，第三方插件没有这个口子），所以引擎选择器的语义是
+**「接下来的任务用哪个引擎」**，不是「当前任务换个引擎」。当前会话在它下次被 DSH 重新载入时跟随新选择。
+
+**尚未实现**：
+- **跨重启的会话→引擎绑定**：绑定表只在进程内；跨重启持久化需要一等公民写入口，见 `ENGINE-SELECTOR-EVIDENCE.md` §选型。
+- **按会话在 UI 里点选引擎**：同因 —— 建 Agent 时才能定引擎，且请求 schema（`SessionCreateRequest`）没有扩展位。
 
 ## 回滚机制
 
@@ -92,9 +124,19 @@ bash rollback.sh
 
 ## 开发与测试
 
-本项目包含三个测试套件：
+本项目包含五个可复跑的测试套件（全部不调模型，除 `endo-pi.sh`）：
 
-### 1. smoke.sh（冒烟测试，27 条）
+### 1. engine-selector.sh（独立引擎选择器，81 条）
+
+验证 Engine ⊥ Preset 的正交组合、判定优先级、会话绑定、`/engine` 命令语法与写盘路径：
+
+```bash
+bash engine-selector.sh
+```
+
+期望输出：`SUMMARY: 81 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+
+### 2. smoke.sh（冒烟测试，27 条）
 
 验证接管基础能力与安全模式：
 
@@ -104,7 +146,17 @@ bash smoke.sh
 
 期望输出：`SMOKE_SH: OK`，27 HIT / 0 MISS。
 
-### 2. test-safe-mode.sh（安全模式测试，3 条）
+### 3. preset-routing.sh（agentPreset 兼容路由，12 条）
+
+验证 `meta.agentPreset` 两向分流（含 `standard` / 缺失 meta 的负向断言）：
+
+```bash
+bash preset-routing.sh
+```
+
+期望输出：`SUMMARY: 12 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+
+### 4. test-safe-mode.sh（安全模式测试，3 条）
 
 验证 `DSH_ENGINE_SWITCH_DISABLE=1` 时零影响：
 
@@ -114,7 +166,7 @@ bash test-safe-mode.sh
 
 期望输出：`RESULT: PASS`，3 HIT / 0 MISS。
 
-### 3. endo-pi.sh（端到端 Pi 引擎测试，11 条）
+### 5. endo-pi.sh（端到端 Pi 引擎测试，11 条）
 
 真实驱动 Pi 引擎的完整流程测试：
 
@@ -128,6 +180,14 @@ bash endo-pi.sh
 - 已配置的 `.pi-agent/` 凭据目录
 - 本机 DSH 源码抽取树（`.recon/dsh-src`），用于获取真实契约定义
 - Pi 客户端可正常访问
+
+### 另外两条零成本回归
+
+```bash
+node config-check.mjs                      # Config schema 校验（含 engine 字段）
+node --no-warnings force-engine.test.mjs   # forceEngine 优先级与负向断言（20 条）
+bash rehearse-rollback.sh                  # 回滚彩排（16 条，含 DESKTOP_UNTOUCHED）
+```
 
 ### 环境变量覆盖
 
@@ -148,6 +208,9 @@ bash endo-pi.sh
 2. **工具桥接未实现**：DSH 的工具调用（tool calls）尚未通过 OAR 传递给引擎
 3. **Steer / Abort 未实现**：用户中断（abort）和引导（steer）操作未处理
 4. **模型必须显式钉死**：在 `real-pi-patch.yml` 中必须指定 `model` 字段（如 `pi-mini-prod`），否则 OAR 会根据自身逻辑自动选择模型，可能与预期不符
+5. **引擎选择器是「新任务默认」而不是「当前任务开关」**：引擎只在建 Agent 时能定，见上文的语义边界一节
+6. **会话→引擎绑定只在进程内**：桌面端重启后，存量会话重新按选择器决定引擎（不跨重启记忆会话身份）
+7. **pi 路由目前不把 DSH 历史交给 pi**：换引擎后继续同一会话，pi 只看到本次输入；跨引擎续跑同一会话会丢上下文
 
 ---
 

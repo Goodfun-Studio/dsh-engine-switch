@@ -7,20 +7,36 @@
  *   3. 把「路由器」写回 ctx.agents.factory = { target: router }
  *   4. 用 ctx.effect 登记卸载时还原原生 target
  *
- * 路由分流：
- *   - 命中 agentPreset / 打了 marker 的调用 → pi 引擎或回声引擎
- *   - 其余调用                              → 原样委托暂存的原生 target（零语义变更）
+ * 路由分流（**Engine 与 Preset 正交**）：
+ *   - 引擎结论由 engine-intent.mjs 按固定优先级收敛（见那里的表），本文件只做接线
+ *   - 未命中任何引擎选择的调用 → 原样委托暂存的原生 target（零语义变更）
  *
- * 分流优先级：forceEngine > agentPreset > pi marker > echo marker > 原生 target。
+ * 分流优先级（高 → 低，逐条可测）：
+ *   forceEngine > 请求 marker（meta.engine/engine） > 会话已绑定引擎
+ *     > agentPreset 兼容命中 > config.engine（独立选择器） > 原生 target
  *
- * preset 约定（config.piPreset，缺省 'pi'）：
+ * Engine 与 Preset 为什么必须分开：
+ *   Agent Preset 决定**会话内容面**（系统提示词模板 / 角色 / 工具插件集：标准、极简、
+ *   创造…）；Engine 决定**底座谁在驱动**（DSH 原生 AgentLoop / OAR 驱动的 pi / 回声）。
+ *   把引擎塞进 preset 下拉框（例如声明一个 `preset-pi` 业务预设）会让两个维度互相
+ *   绑架：新增一个引擎就得往「标准模式/创造模式」那一列里加一项。故本插件**不再**
+ *   声明任何 pi preset（cordis.patch.yml 里没有 preset-pi），引擎走自己的入口：
+ *     ① 斜杠命令 `/engine [native|pi|echo]`（输入区域，见 engine-command.mjs）
+ *     ② 本插件自己的配置字段 `engine`（volatile ⇒ 设置页可编辑）
+ *     ③ 请求级 marker（headless / ACP / 脚本按次钉死）
+ *
+ * preset 兼容约定（config.piPreset，缺省 'pi'，**保留但不暴露 UI**）：
  *   options.meta.agentPreset === piPreset  → pi 引擎（真引擎，见 oar-engine.mjs）
- *   缺失或为别的值（如 'standard'）        → 不触发 preset 分流，回落 marker 判定，
+ *   缺失或为别的值（如 'standard'）        → 不触发 preset 分流，回落后续判据，
  *                                            最终原样直通原生 target（负向防误杀）
+ *   保留它的理由：改造前已建/已存量的会话可能在 header 里记着 `agentPreset: pi`，
+ *   那条会话身份必须继续被认下来；它**不是**引擎的定义，只是引擎的一个兼容输入。
  *
- * marker 约定（两者自动兼容）：
+ * marker 约定（请求级分流意图，两者自动兼容）：
  *   options.meta.engine === 'echo'  ||  options.engine === 'echo'  → 回声引擎（合成帧）
  *   options.meta.engine === 'pi'    ||  options.engine === 'pi'    → pi 引擎（真引擎，见 pi-engine.mjs）
+ *   options.meta.engine === 'native'||  options.engine === 'native'→ 显式要求原生（新增取值）
+ *   其余取值（'PI' / 'pi ' / 'pi-lite' / 空串 …）一律不作数（负向防误杀）
  *
  * 事件桥（本轮新增的「打通的那半步」）：
  *   - 事件分发设施来自真实上游包 `@deepseek-ai/dsh-agent` 的公开导出
@@ -49,20 +65,82 @@ import {
   PI_PROMPT,
   PI_OK_MARKER,
 } from './oar-engine.mjs'
+import {
+  createEngineBindings,
+  ECHO_ENGINE_ID as ECHO_ID,
+  engineMarkerOf,
+  ENGINE_IDS,
+  ENGINE_SOURCES,
+  NATIVE_ENGINE_ID,
+  normalizeEngineId,
+  resolveEngineIntent,
+  sessionIdOf,
+} from './engine-intent.mjs'
+import {
+  ENGINE_COMMAND_DESCRIPTION,
+  ENGINE_COMMAND_HINT,
+  ENGINE_COMMAND_NAME,
+  errorResultText,
+  parseEngineCommand,
+  selectResultText,
+  showResultText,
+} from './engine-command.mjs'
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 
-/** agentPreset 命中后路由到 pi 引擎的默认 preset 名（config.piPreset 的默认值）。 */
+/** agentPreset 兼容命中后路由到 pi 引擎的默认 preset 名（config.piPreset 的默认值）。 */
 export const DEFAULT_PI_PRESET = 'pi'
 
+/** 本插件在 profile 里的缺省 entry id（= settings 命名空间名，见 resolveEntryId）。 */
+export const DEFAULT_ENTRY_ID = 'engine-switch'
+
+/** cosmokit 的 volatile 写标记（跨 ESM/CJS 副本同款共享符号；只读不写）。 */
+export const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
 /**
- * schemastery Config 导出：引擎选择器（forceEngine 枚举）+ agentPreset 名（piPreset）
- * + 接管证据路径 + 等待超时。
+ * 判定一个值是不是 cosmokit 的 volatile config 引用。
+ * 用共享符号判身份（与 cosmokit 自己的 isVolatile 同款），不靠 `typeof value.get`
+ * 这种形似判据 —— 普通对象带个 get 方法不该被当成引用。
+ * @param {unknown} value 候选值
+ * @returns {boolean} 是否为 volatile 引用
+ */
+export function isVolatileRef(value) {
+  return typeof value === 'object' && value !== null && VOLATILE_WRITE in value
+}
+
+/**
+ * 读一个 config 字段的**当前**值：volatile 引用取 get()，普通值原样返回。
+ * volatile 字段会随配置层更新自动换值（loader 的 _commitVolatile），所以这里必须
+ * 每次现读，不能在 apply 时快照。
+ * @param {unknown} value config 字段
+ * @returns {unknown} 当前值
+ */
+export function readVolatile(value) {
+  if (!isVolatileRef(value)) return value
+  try {
+    return value.get()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * schemastery Config 导出。
+ *
+ * - `engine`：**独立引擎选择器**（与 Agent Preset 正交）。volatile ⇒ 进 settings
+ *   命名空间，设置页可编辑，且值随写入实时生效（本进程内无需重启）。
+ * - `forceEngine`：运维/测试硬开关，优先级最高，语义与改造前逐字一致。
+ * - `piPreset`：**兼容**用的 agentPreset 名（不再向 UI 暴露任何 pi preset）。
+ * - `entryId` / `commandName` / `commandsEnabled`：`/engine` 命令与 settings 命名空间的接线。
  */
 export const Config = z.object({
-  forceEngine: z.union(['native', 'pi', 'echo']).default('native'),
+  engine: z.union(['native', 'pi', 'echo']).default(NATIVE_ENGINE_ID).volatile(),
+  forceEngine: z.union(['native', 'pi', 'echo']).default(NATIVE_ENGINE_ID),
   piPreset: z.string().default(DEFAULT_PI_PRESET),
+  entryId: z.string().default(DEFAULT_ENTRY_ID),
+  commandName: z.string().default(ENGINE_COMMAND_NAME),
+  commandsEnabled: z.boolean().default(true),
   evidencePath: z.string(),
   timeoutMs: z.number().default(10000),
 })
@@ -83,8 +161,14 @@ export { createOarEngine, isPiMarked, PI_ENGINE_ID, PI_PROMPT, PI_OK_MARKER }
 /** 插件名（日志/效果名可读性）。 */
 export const PLUGIN_NAME = '@local/dsh-engine-switch'
 
-/** 回声引擎标识。 */
-export const ECHO_ENGINE_ID = 'echo'
+/** 回声引擎标识（词汇的唯一定义处是 engine-intent.mjs，此处只是转出去）。 */
+export const ECHO_ENGINE_ID = ECHO_ID
+
+/** 全部被承认的引擎 id（转出 engine-intent.mjs 的词汇）。 */
+export const ENGINE_IDS_ALL = ENGINE_IDS
+
+/** 判定来源的全部取值（转出 engine-intent.mjs 的词汇）。 */
+export const ENGINE_INTENT_SOURCES = ENGINE_SOURCES
 
 /** DSH 流式帧事件名（真实词汇，来自 dsh-agent 的 agent/* 契约）。 */
 export const ECHO_STREAM_EVENT = 'agent/assistant-stream'
@@ -359,37 +443,50 @@ export function resolveForcedRoute(forceEngine, engines = {}) {
 }
 
 /**
- * 构造路由器：按 forceEngine / agentPreset / marker 分流到 pi 引擎 / 回声引擎 / 暂存的原生 target。
+ * 构造路由器：按「引擎意图」分流到 pi 引擎 / 回声引擎 / 暂存的原生 target。
  *
- * 分流优先级（本轮新增 agentPreset preset 分流）：
- *   forceEngine（命中已知引擎时忽略其余判据，一律强制）
- *     > options.meta.agentPreset === piPreset
- *     > pi marker > echo marker > 原生 target
+ * 路由结论本身不在本函数里：它由 {@link resolveEngineIntent} 按固定优先级收敛
+ * （forceEngine > 请求 marker > 会话已绑定引擎 > agentPreset 兼容命中 > config.engine
+ * > 原生 target）。本函数只管：读来源 → 问结论 → 记会话绑定 → 调用对应引擎。
  *
- * 三者皆未命中时，与改造前逐字一致：一律原样委托原生 target，零回归。
- * 负向防误杀：agentPreset 缺失或为别的值（如 'standard'）**不**触发 preset 分流，
- * 回落 marker 判定，最终直通原生 target —— 判据见 {@link isPiPreset}。
+ * 负向防误杀：任何来源里引擎取值不作数（'PI' / 'pi ' / 'pi-lite' / 空串 / null /
+ * 非字符串）时该来源直接跳过；agentPreset 缺失或为别的值（如 'standard'）时
+ * preset 兼容命中为 false。两者叠加的最终结果是**原样直通原生 target**，与改造前一致。
  *
- * piEngine 可省略（省略时 preset / pi marker 双双向原生委托，便于未接引擎的单测）。
+ * piEngine 可省略（省略时 pi 路由退化为原生委托，便于未接引擎的单测）。
  *
  * @param {object} nativeTarget 暂存的原生 factory target（含 createAgent/resume）
  * @param {object} echoEngine 回声引擎
- * @param {object} [piEngine] 真实 pi 引擎（pi-engine.mjs 的 createPiEngine）
- * @param {{forceEngine?:string|null, piPreset?:string, onNative?:Function, onEcho?:Function, onPi?:Function, onPiResult?:Function}} [hooks]
+ * @param {object} [piEngine] 真实 pi 引擎（oar-engine.mjs 的 createOarEngine）
+ * @param {{forceEngine?:string|null, piPreset?:string, readConfigEngine?:Function,
+ *          bindings?:object, onNative?:Function, onEcho?:Function, onPi?:Function,
+ *          onResolved?:Function, onPiResult?:Function}} [hooks]
+ *   `readConfigEngine` 必须是**现读函数**而不是值：选择器是 volatile 字段，用户在设置页
+ *   或 `/engine` 改了它必须立刻生效，不能在 install 时快照下来。
  */
 export function createRouter(nativeTarget, echoEngine, piEngine, hooks = {}) {
-  /** forceEngine 生效后的强制路由目标（null = 不强制，走 preset/marker 分流）。 */
+  /** forceEngine 生效后的强制路由目标（null = 不强制，走引擎意图判定）。 */
   const forcedRoute = resolveForcedRoute(hooks.forceEngine ?? null, { piEngine, echoEngine })
-  /** 命中即路由到 pi 引擎的 agentPreset 名。 */
+  /** 兼容用的 agentPreset 名。 */
   const piPreset = normalizePiPreset(hooks.piPreset)
+  /** 独立选择器的现读函数（缺省读不到 ⇒ null ⇒ 不作数）。 */
+  const readConfigEngine = typeof hooks.readConfigEngine === 'function' ? hooks.readConfigEngine : () => null
+  /** 会话 → 引擎 绑定表（进程内）：同一会话只认一个底座，见 engine-intent.mjs。 */
+  const bindings = hooks.bindings ?? createEngineBindings()
   const delegate = (kind, engineCtx, options) => {
-    const route =
-      forcedRoute ??
-      (isPiPreset(options, piPreset) || isPiMarked(options)
-        ? 'pi'
-        : isEchoMarked(options)
-          ? 'echo'
-          : 'native')
+    const sessionId = sessionIdOf(options)
+    const resolution = resolveEngineIntent({
+      forcedRoute,
+      requestMarker: engineMarkerOf(options),
+      sessionBinding: bindings.get(sessionId),
+      presetMatched: isPiPreset(options, piPreset),
+      configEngine: normalizeEngineId(readConfigEngine()),
+    })
+    const route = resolution.engine
+    if (sessionId !== null) bindings.bind(sessionId, route)
+    if (typeof hooks.onResolved === 'function') {
+      hooks.onResolved(kind, resolution, engineCtx, options)
+    }
     const receiver =
       route === 'pi' ? piEngine ?? nativeTarget : route === 'echo' ? echoEngine : nativeTarget
     const notify = hooks[`on${route[0].toUpperCase()}${route.slice(1)}`]
@@ -418,6 +515,11 @@ export function createRouter(nativeTarget, echoEngine, piEngine, hooks = {}) {
     forceEngine: hooks.forceEngine ?? null,
     forcedRoute,
     piPreset,
+    /** 选择器当前值（现读，不是 install 时的快照）。 */
+    get configEngine() {
+      return normalizeEngineId(readConfigEngine())
+    },
+    bindings,
     createAgent(engineCtx, options) {
       return delegate('createAgent', engineCtx, options)
     },
@@ -466,7 +568,10 @@ export const STATE = Symbol.for('@local/dsh-engine-switch#state')
  * @param {{timeoutMs?: number}} [config]
  */
 /** 接管证据 JSON 的结构版本号（字段变更时递增）。 */
-export const EVIDENCE_VERSION = 1
+export const EVIDENCE_VERSION = 2
+
+/** 证据里保存的会话→引擎绑定条数上限（只保尾部，不随会话数无限膨胀）。 */
+export const BINDING_SNAPSHOT_LIMIT = 50
 
 /** 上游共享符号：cordis 追踪代理上指向真实服务实例（与 AgentRegistry.setFactory 同一约定）。 */
 export const CORDIS_ORIGINAL = Symbol.for('cordis.original')
@@ -506,6 +611,44 @@ export function createEvidenceStore(config = {}) {
     piByKind: { createAgent: 0, resume: 0 },
     forcedEngine: null,
     forcedRoute: null,
+    // —— 独立引擎选择器（Engine ⊥ Preset）的可观测面 ——
+    /** 选择器当前值（config.engine 现读归一化后的引擎 id）。 */
+    engineSelector: null,
+    /** 选择器原始值（非字符串时记 String()，仅供诊断，不参与判定）。 */
+    engineSelectorRaw: null,
+    /** 最后一次现读发生在哪个阶段（'apply' | 'command'）。 */
+    engineSelectorPhase: null,
+    /** 本插件在 profile 里的 entry id（= settings 命名空间名）。 */
+    engineEntryId: null,
+    /**
+     * 上面那个 id 是怎么来的：
+     * 'fiber-options' = loader 声明 id（真机常态）| 'fiber-entry' = 树内限定 id |
+     * 'config' = config.entryId | 'default' = 内置缺省。
+     */
+    engineEntryIdSource: null,
+    /** 最近一次 create/resume 的引擎结论 `{engine, source}`。 */
+    engineIntent: null,
+    /** 每种判定来源各决定过多少次（含 default）。 */
+    engineSourceCounts: {
+      forceEngine: 0,
+      requestMarker: 0,
+      sessionBinding: 0,
+      agentPreset: 0,
+      config: 0,
+      default: 0,
+    },
+    /** 会话→引擎 绑定表规模与快照（快照上限 50 条，防止证据无限膨胀）。 */
+    engineBindingCount: 0,
+    engineBindings: {},
+    // —— `/engine` 命令（选择器在输入区域的入口）——
+    commandName: null,
+    commandRegistered: false,
+    commandError: null,
+    commandRuns: 0,
+    commandLastOutcome: null,
+    commandLastEngine: null,
+    commandLastError: null,
+    commandLastBindingCleared: null,
     piText: '',
     piTextLength: 0,
     piTextDeltas: 0,
@@ -561,6 +704,80 @@ export function createEvidenceStore(config = {}) {
       write('pi-engine')
     },
     /**
+     * 记一次引擎结论（来源 + 引擎）与当前会话绑定表。
+     * @param {'native'|'pi'|'echo'} engine 引擎结论
+     * @param {string} source 结论来源（见 ENGINE_SOURCES）
+     * @param {object} [bindings] 会话绑定表（提供时顺便快照）
+     * @returns {object} 证据对象
+     */
+    recordEngineIntent(engine, source, bindings) {
+      evidence.engineIntent = { engine: engine ?? null, source: source ?? null }
+      if (typeof source === 'string' && Object.hasOwn(evidence.engineSourceCounts, source)) {
+        evidence.engineSourceCounts[source] += 1
+      }
+      if (bindings !== undefined && bindings !== null) {
+        evidence.engineBindingCount = bindings.size()
+        const entries = Object.entries(bindings.snapshot())
+        evidence.engineBindings = Object.fromEntries(entries.slice(-BINDING_SNAPSHOT_LIMIT))
+      }
+      write('engine-intent')
+      return evidence
+    },
+    /**
+     * 记选择器的当前值（每次现读都写一次，便于观察 settings 写入是否真的换值）。
+     * @param {unknown} normalized 归一化后的引擎 id（或 null）
+     * @param {unknown} raw 原始值
+     * @returns {object} 证据对象
+     */
+    recordEngineSelector(normalized, raw, phase) {
+      evidence.engineSelector = normalized ?? null
+      evidence.engineSelectorRaw = typeof raw === 'string' ? raw : raw === undefined ? null : String(raw)
+      evidence.engineSelectorPhase = phase ?? null
+      write('engine-selector')
+      return evidence
+    },
+    /**
+     * 记 entry id 的解析结果。
+     * @param {string} entryId settings 命名空间名
+     * @param {'fiber-options'|'fiber-entry'|'config'|'default'} source 来源
+     * @returns {object} 证据对象
+     */
+    recordEntryId(entryId, source) {
+      evidence.engineEntryId = entryId
+      evidence.engineEntryIdSource = source
+      write('engine-entry-id')
+      return evidence
+    },
+    /**
+     * 记 `/engine` 命令的注册结果。
+     * @param {{name?:string, registered:boolean, error?:unknown}} outcome 注册结果
+     * @returns {object} 证据对象
+     */
+    recordCommandRegistration(outcome) {
+      evidence.commandName = outcome.name ?? evidence.commandName
+      evidence.commandRegistered = outcome.registered === true
+      evidence.commandError =
+        outcome.error === undefined || outcome.error === null ? null : String(outcome.error)
+      write('engine-command')
+      return evidence
+    },
+    /**
+     * 记一次 `/engine` 命令执行。（只记结果面，不记用户原文。）
+     * @param {{outcome:string, engine?:string, bindingCleared?:boolean, error?:unknown}} run 执行结果
+     * @returns {object} 证据对象
+     */
+    recordCommandRun(run) {
+      evidence.commandRuns += 1
+      evidence.commandLastOutcome = run.outcome ?? null
+      evidence.commandLastEngine = run.engine ?? null
+      evidence.commandLastBindingCleared =
+        run.bindingCleared === undefined ? null : run.bindingCleared
+      evidence.commandLastError =
+        run.error === undefined || run.error === null ? null : String(run.error)
+      write('engine-command-run')
+      return evidence
+    },
+    /**
      * 记录 pi 引擎一次 attempt 的**真实**产出（PI_TEXT_IN_REAL_DSH 的唯一依据）。
      * 文本取自 pi 子进程 text_delta 拼接（pi-engine.mjs 的 mapper.text），非本地伪造；
      * 失败路径同样落盘 piEngineError，禁止把失败伪装成空文本通过。
@@ -603,6 +820,189 @@ export function createEvidenceStore(config = {}) {
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{timeoutMs?: number, evidencePath?: string}} [config]
  */
+/**
+ * 解析本插件在 profile 里的 entry id（= settings 命名空间名）。
+ *
+ * 优先级：loader 声明的 entry id（`fiber.entry.options.id`）> 树内限定 id
+ * （`fiber.entry.id`）> config.entryId > 内置缺省。
+ *
+ * **为什么先看 `options.id` 而不是 `entry.id`**（真机启动实测，不是推测）：
+ * bundle patch 的 `insert` 行被 loader 挂进 `include:` 树后，`ctx.fiber.entry.id`
+ * 会变成**树内限定 id**（实测拿到的是 `include:engine-switch`），而 settings 的命名空间
+ * 是按**声明 id**（`entry.options.id` = `engine-switch`）登记的（`dsh-settings` 的
+ * `describe()` 里逐字是 `ns: entry.options.id`）。拿限定 id 去写 settings 会报
+ * `namespace-unavailable` —— 这一条只有在真机启动里才能看到，所以抽成纯函数直接测。
+ *
+ * @param {object|null|undefined} entryRef loader 条目（`ctx.fiber.entry`）
+ * @param {{entryId?:unknown}} [config] 插件配置
+ * @returns {{entryId:string, source:'fiber-options'|'fiber-entry'|'config'|'default'}}
+ */
+export function resolveEngineEntryId(entryRef, config = {}) {
+  const declared = entryRef?.options?.id
+  if (typeof declared === 'string' && declared.length > 0) {
+    return { entryId: declared, source: 'fiber-options' }
+  }
+  const qualified = entryRef?.id
+  if (typeof qualified === 'string' && qualified.length > 0) {
+    return { entryId: qualified, source: 'fiber-entry' }
+  }
+  if (typeof config.entryId === 'string' && config.entryId.length > 0) {
+    return { entryId: config.entryId, source: 'config' }
+  }
+  return { entryId: DEFAULT_ENTRY_ID, source: 'default' }
+}
+
+/**
+ * 把引擎选择器写进本插件自己的 volatile 配置字段。
+ *
+ * 为什么不造一个自定 remote：第三方插件要暴露 remote 得自带一套 Typert 生成物
+ * （reflection + 严格 codec + lookup provider + 客户端 $mount），代价与失败面都远大于
+ * 收益；而 DSH 已经给了**通用**的 settings 写入口（`ctx.remote.settings.*`），它的
+ * 命名空间就是「插件的 profile entry id」，可写字段就是「该插件声明的 volatile 字段」。
+ * 所以引擎选择器就直接落在本插件自己的配置字段 `engine` 上：桌面端的设置页能改它，
+ * `/engine` 命令也能改它，两边改的是同一个权威值。
+ *
+ * 不抛异常：失败以 `{ok:false, error}` 返回，由命令层翻成人话文案（不静默吞）。
+ *
+ * @param {object} ctx 插件上下文
+ * @param {string} entryId settings 命名空间名（= 本插件的 profile entry id）
+ * @param {unknown} engine 目标引擎
+ * @returns {Promise<{ok:true}|{ok:false, error:string, token?:string, detail?:string}>} 写入结果
+ */
+export async function writeEngineSelector(ctx, entryId, engine) {
+  const normalized = normalizeEngineId(engine)
+  if (normalized === null) return { ok: false, error: 'unknown-engine', token: String(engine) }
+  const settings = typeof ctx?.get === 'function' ? ctx.get('settings') : undefined
+  if (settings === undefined || settings === null) return { ok: false, error: 'settings-unavailable' }
+  if (typeof settings.describe !== 'function' || typeof settings.update !== 'function') {
+    return { ok: false, error: 'write-failed', detail: 'settings service lacks describe()/update()' }
+  }
+  let rows
+  try {
+    rows = settings.describe()
+  } catch (error) {
+    return { ok: false, error: 'write-failed', detail: String(error?.message ?? error) }
+  }
+  const row = Array.isArray(rows) ? rows.find((item) => item?.ns === entryId) : undefined
+  if (row === undefined) {
+    return { ok: false, error: 'namespace-unavailable', detail: entryId }
+  }
+  try {
+    // 带 revision 写：配置在我们读取之后被别人改过时会被拒，而不是把别人的改动覆盖掉。
+    await settings.update(entryId, { engine: normalized }, row.revision)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: 'write-failed', detail: String(error?.message ?? error) }
+  }
+}
+
+/**
+ * 注册 `/engine` 斜杠命令 —— 独立引擎选择器在**输入区域**的入口。
+ *
+ * 命令面是 DSH 的一等公民（`dsh-commands` + `dsh-client-ui-commands`）：插件在 host 侧
+ * 注册，Web/桌面端的 `/` 菜单自动出现，与 preset 下拉框毫无关系（正交）。
+ *
+ * 可选依赖（不在 inject 里硬要）：`commands` 缺失时本函数静默不注册，把事实写进证据，
+ * 插件的路由能力不受任何影响。
+ *
+ * @param {object} ctx 插件上下文
+ * @param {object} config 插件配置
+ * @param {object} store 证据落盘器
+ * @param {object} bindings 会话→引擎绑定表
+ * @param {string} entryId settings 命名空间名
+ * @param {(phase:string)=>(string|null)} readSelector 选择器现读函数
+ * @returns {{name:string, fiber:object|null, error:string|null}} 注册结果
+ */
+export function registerEngineCommand(ctx, config, store, bindings, entryId, readSelector) {
+  const name =
+    typeof config.commandName === 'string' && config.commandName.length > 0
+      ? config.commandName
+      : ENGINE_COMMAND_NAME
+  if (config.commandsEnabled === false) {
+    store.recordCommandRegistration({ name, registered: false, error: 'disabled-by-config' })
+    return { name, fiber: null, error: 'disabled-by-config' }
+  }
+  if (typeof ctx?.inject !== 'function') {
+    store.recordCommandRegistration({ name, registered: false, error: 'no-inject' })
+    return { name, fiber: null, error: 'no-inject' }
+  }
+  let fiber = null
+  try {
+    fiber = ctx.inject(['commands'], (commandCtx) => {
+      try {
+        commandCtx.commands.register({
+          name,
+          description: ENGINE_COMMAND_DESCRIPTION,
+          // 不把命令原文写进会话史：这次选择的权威记录是本插件的 settings 文档
+          // （profile Cordis patch），会话史里再记一份只增噪声、没有读者。
+          recordInput: false,
+          input: { hint: ENGINE_COMMAND_HINT },
+          handler: async ({ agent, rawInput }) => {
+            const parsed = parseEngineCommand(rawInput)
+            const sessionId =
+              typeof agent?.session?.id === 'string'
+                ? agent.session.id
+                : typeof agent?.id === 'string'
+                  ? agent.id
+                  : null
+            if (parsed.kind === 'show') {
+              store.recordCommandRun({ outcome: 'show' })
+              return {
+                kind: 'success',
+                text: showResultText({
+                  selectorEngine: readSelector('command'),
+                  sessionEngine: bindings.get(sessionId),
+                  sessionId,
+                }),
+              }
+            }
+            if (parsed.kind !== 'select') {
+              store.recordCommandRun({
+                outcome: parsed.kind,
+                error: parsed.kind === 'unknown' ? parsed.token : parsed.reason,
+              })
+              return {
+                kind: 'error',
+                text:
+                  parsed.kind === 'unknown'
+                    ? errorResultText({ error: 'unknown-engine', token: parsed.token })
+                    : errorResultText({ error: 'bad-input' }),
+              }
+            }
+            const write = await writeEngineSelector(ctx, entryId, parsed.engine)
+            if (write.ok !== true) {
+              store.recordCommandRun({ outcome: 'error', engine: parsed.engine, error: write.error })
+              return { kind: 'error', text: errorResultText(write) }
+            }
+            // 用户在本会话里显式改选 ⇒ 解除本会话的历史绑定，让这次选择对当前会话也生效
+            // （在它下次被 DSH 重新载入时；活体换装在第三方插件里没有口子，见 selectResultText）。
+            const bindingCleared = bindings.clear(sessionId)
+            store.recordCommandRun({
+              outcome: 'select',
+              engine: parsed.engine,
+              bindingCleared,
+            })
+            return {
+              kind: 'success',
+              text: selectResultText({ engine: parsed.engine, bindingCleared }),
+            }
+          },
+        })
+        store.recordCommandRegistration({ name, registered: true, error: null })
+      } catch (error) {
+        store.recordCommandRegistration({ name, registered: false, error })
+        if (typeof commandCtx.logger?.warn === 'function') {
+          commandCtx.logger.warn('dsh-engine-switch: failed to register /%s: %o', name, error)
+        }
+      }
+    })
+  } catch (error) {
+    store.recordCommandRegistration({ name, registered: false, error })
+    return { name, fiber: null, error: String(error?.message ?? error) }
+  }
+  return { name, fiber: fiber ?? null, error: null }
+}
+
 export function apply(ctx, config = {}) {
   // L0 安全模式：环境变量 DSH_ENGINE_SWITCH_DISABLE=1 时，插件等于不存在
   if (process.env.DSH_ENGINE_SWITCH_DISABLE === '1') {
@@ -625,9 +1025,41 @@ export function apply(ctx, config = {}) {
   /** forceEngine 配置：默认 null（保持既有 marker 分流，零行为变更）；'pi' 时所有 create/resume 一律交给 pi 引擎。 */
   const forceEngine = normalizeForceEngine(config.forceEngine)
   if (forceEngine !== null) process.env.DSH_ENGINE_SWITCH_FORCE_ENGINE = forceEngine
-  /** agentPreset 分流配置：options.meta.agentPreset 命中该名时一律交给 pi 引擎；缺省 'pi'。 */
+  /** agentPreset 兼容配置：options.meta.agentPreset 命中该名时一律交给 pi 引擎；缺省 'pi'。 */
   const piPreset = normalizePiPreset(config.piPreset)
   const store = createEvidenceStore(config)
+
+  /**
+   * 选择器的**现读**唯一定义处。
+   * volatile 字段会随 settings 写入自动换值（loader 的 _commitVolatile），因此每次
+   * 判定都现读，绝不在 apply 时快照 —— 否则用户在设置页/命令里改了不生效。
+   * @returns {{normalized:'native'|'pi'|'echo'|null, raw:unknown}}
+   */
+  const readEngineSelectorNow = () => {
+    const raw = readVolatile(config.engine)
+    return { normalized: normalizeEngineId(raw), raw }
+  }
+
+  /**
+   * 现读 + 落证据（apply / `/engine` 命令这两个低频入口用）。
+   * 路由热路径**不**走这里：那会变成每次 create/resume 都写一次证据文件，
+   * 而热路径的结论已经由 engineIntent 记录下来。
+   * @param {'apply'|'command'} phase 现读阶段
+   * @returns {'native'|'pi'|'echo'|null} 归一化后的选择器值
+   */
+  const readEngineSelector = (phase) => {
+    const { normalized, raw } = readEngineSelectorNow()
+    store.recordEngineSelector(normalized, raw, phase)
+    return normalized
+  }
+
+  const entry = resolveEngineEntryId(ctx?.fiber?.entry, config)
+  store.recordEntryId(entry.entryId, entry.source)
+  /** apply 时先现读一次选择器：证据里就能看到「本进程开始时选择器是什么」。 */
+  readEngineSelector('apply')
+  /** 会话 → 引擎 绑定表（进程内）：同一会话只认一个底座。 */
+  const bindings = createEngineBindings()
+  const registerCommand = registerEngineCommand(ctx, config, store, bindings, entry.entryId, readEngineSelector)
   const state = {
     installed: null,
     disposed: false,
@@ -675,9 +1107,14 @@ export function apply(ctx, config = {}) {
     const router = createRouter(nativeTarget, echoEngine, piEngine, {
       forceEngine,
       piPreset,
+      readConfigEngine: () => readEngineSelectorNow().normalized,
+      bindings,
       onNative: (kind) => store.countNative(kind),
       onEcho: (kind) => store.countEcho(kind),
       onPi: (kind) => store.countPi(kind),
+      onResolved: (kind, resolution) => {
+        store.recordEngineIntent(resolution.engine, resolution.source, bindings)
+      },
       onPiResult: async (kind, result, error, engineCtx, options) => {
         // createAgent 阶段：只建会话，不跑 pi（把 pi 留给 followup）
         if (kind === 'createAgent') {

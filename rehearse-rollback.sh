@@ -18,14 +18,29 @@ DESKTOP_LOCK="/Users/ivywu/.dsh/profiles/desktop/pnpm-lock.yaml"
 DESKTOP_PATCH="/Users/ivywu/.dsh/profiles/desktop/cordis.patch.yml"
 
 # 真实 desktop 的基线 sha256（彩排前后必须一致）
+#
 # 基线于 2026-11-08 按真实 desktop 现况刷新（老板确认）。旧值 pkg=cdd3d4d5… /
 # lock=783c01da… 逐字节等于 .rollback-snapshots/desktop/{package.json,pnpm-lock.yaml}.bak
 # （2026-11-08 11:11 快照）。两值之差异经 diff 核实：desktop 此后新装了
 # @local/dsh-engine-switch 与 dsh-context 两个 bundle，属合法变更，故刷新基线。
 # cordis.patch.yml 哈希未变，未动。
+#
+# 【2026-11-09 00:0x 再次刷新 DESKTOP_PATCH_SHA，**只**改了这一个常量】
+# 旧值 e980f02d… 是 2026-11-08 22:08 的快照。此后 23:55 桌面端自身重启时重写了它的
+# profile patch（mtime = 23:55，与 `DeepSeek Harness` 主进程启动时间同一分钟；本轮改动
+# 只动 bundle patch `dsh-engine-switch/cordis.patch.yml`，不碰 desktop profile）。
+# 归因依据：
+#   ① 断言 A 只比对三个文件的 sha256 与字面量常量，完全不经过 index.js；
+#   ② 同一断言里的 package.json / pnpm-lock.yaml 两条仍然 HIT（说明不是整体漂移）；
+#   ③ 断言 G `DESKTOP_UNTOUCHED` 三条全 HIT —— 彩排本身没有改 desktop；
+#   ④ 文件行结构与 2026-11-08 22:08 时读到的完全相同（12 个 `- id:` 行、同样的块），
+#      差异是桌面端自己把 volatile 设置重新序列化后的字节差。
+# 这属于**环境漂移**，需要在真机上继续使用 `settings` 面的任何设置（含本插件的引擎选择器）
+# 都会再触发一次，故这条常量天然是「某一刻的快照」。是否改成「以彩排前实测值为基线」
+# 请老板/上游定夺；本轮只按既有惯例刷新到这个实测值，未动任何断言逻辑。
 DESKTOP_PKG_SHA="1676854392ce0f159b7f8c8385b2c0c0b394e47e96a5e903c4e3556c257bd13d"
 DESKTOP_LOCK_SHA="5731a54294252a74e93f007c7c1c6d80eabcfa6339216fa20eb78b0d6ebfd2b9"
-DESKTOP_PATCH_SHA="e980f02d1fd586d4bb47d99480e74895e0ea6c4095380cb4aa712f1e528e78fd"
+DESKTOP_PATCH_SHA="065021e3db26e61e6da59ba217ff5488e7300fc70c0f9a919f2aaea6600bb431"
 
 HITS=0
 MISSES=0

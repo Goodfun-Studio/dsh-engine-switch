@@ -1,31 +1,34 @@
-# dsh-engine-switch bundle patch —— 在本 bundle 的层里追加两行，顺序即行序。
+# dsh-engine-switch bundle patch —— 在本 bundle 的层里只追加**一行**。
 #
-# 1. `engine-switch`：插件本体。它在 apply 时接管 ctx.agents 的 factory slot，
-#    按 forceEngine / agentPreset / marker 决定 create|resume 落到哪个引擎。
+# `engine-switch`：插件本体。它在 apply 时接管 ctx.agents 的 factory slot，按
+# engine 意图（forceEngine / 请求 marker / 会话绑定 / agentPreset 兼容命中 / 独立
+# 选择器 config.engine）决定 create|resume 落到哪个引擎。
 #
-# 2. `preset-pi`：「Pi 引擎」的 Agent preset 声明，让桌面端新建会话的 Preset
-#    下拉菜单里出现这一项。声明形状与 dsh-web-app 自带的 presets/*.patch.yml
-#    逐字同款（同一 `@deepseek-ai/dsh-agent-preset` 行类型，由宿主 profile 的
-#    dsh-agent-preset-registry 收集成 roster）。
+# ⚠️ 这里**故意不再声明任何 preset**。
 #
-# 两者的接头就是 `config.id`：会话选中的 preset 身份会以
-# `agentPreset` 写进 session header，并在 `ctx.agents.create/resume` 的
-# `options.meta.agentPreset` 上到达插件；插件拿它与自己的 `config.piPreset`
-# （默认 `'pi'`）比对，命中则整段交给 OAR 驱动的 pi 引擎。
-# 所以改这里的 `id` 必须同步改插件的 `piPreset`，否则 UI 选中项不会被接管。
+# 上一轮曾在这个文件里加过一行 `preset-pi`（@deepseek-ai/dsh-agent-preset，
+# config.id: pi），让「Pi 引擎」出现在桌面端新建任务页的 **Agent 预设下拉框**里。
+# 那是错位的：Agent Preset 决定**会话内容面**（系统提示词模板 / 角色 / 工具插件集：
+# 标准、极简、创造…），Engine 决定**底座谁在驱动**（DSH 原生 AgentLoop / OAR 驱动的
+# pi / 回声）。把引擎降格成「预设的一种」，等于每多一个引擎就往「标准模式 / 创造模式」
+# 那一列里塞一项 —— 两个正交维度被焊死在一起。
 #
-# `plugins: []` 是 schema 必填项，此处刻意为空：pi 引擎自己就是一个完整 agent
-# （自带循环与工具），这个 preset 不额外组合任何宿主面 child plugin。
+# 现在引擎走自己的三个入口（都与 preset 下拉框无关）：
+#   ① 斜杠命令 `/engine [native|pi|echo]`（输入区域；host 侧注册，见 engine-command.mjs）
+#   ② 本插件自己的配置字段 `engine`（volatile ⇒ 设置页可编辑、实时生效、写回 profile patch）
+#   ③ 请求级 marker（`options.meta.engine` / `options.engine`，给 headless / ACP / 脚本按次钉死）
+#
+# 于是「创造模式 + Pi 引擎」「标准模式 + Pi 引擎」都是合法且独立的组合：preset 照旧在
+# 新建任务页的预设 chip 里选（原生四种业务模式），engine 在上面任一入口选。
+#
+# 历史兼容（**没有** UI，但判据仍在）：改造前已建/已存量的会话可能在 session header
+# 里记着 `agentPreset: pi`，插件会继续按 config.piPreset（缺省 'pi'）把这类会话交给
+# pi 引擎 —— 会话自己的身份优先于全局缺省，见 engine-intent.mjs 的优先级表。
+#
+# `Config.engine` 是 volatile 字段，所以 settings 会把本 entry 的 id（`engine-switch`）
+# 当作命名空间暴露出来；桌面端设置页与 `/engine` 命令改的是同一个值（profile
+# cordis.patch.yml 里的 `engine-switch: { engine: ... }`）。
 - insert:
     - id: engine-switch
       name: '@local/dsh-engine-switch'
       config: {}
-
-    - id: preset-pi
-      name: '@deepseek-ai/dsh-agent-preset'
-      config:
-        id: pi
-        name: Pi 引擎
-        description: 本会话由 pi 驱动（经 OAR），使用 pi 自己的循环与工具。
-        order: 20
-        plugins: []
