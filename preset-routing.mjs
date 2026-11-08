@@ -16,17 +16,21 @@
  * 退出码：全部 HIT → 0；任一 MISS → 1。
  */
 import { registerHooks } from 'node:module'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 
-const NM =
-  '/Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-src/dsh/node_modules/@deepseek-ai'
-const WS = '/Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch'
+// 推导路径：优先使用环境变量，否则从 import.meta.url 推导
+// （与 smoke.mjs / force-engine.test.mjs / pi-probe.mjs 同款，机器无关）
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const ROOT = process.env.DSH_WORKSPACE || join(__dirname, '..')
+const NM = join(ROOT, '.recon/dsh-src/dsh/node_modules/@deepseek-ai')
+const WS = join(ROOT, 'dsh-engine-switch')
 const imp = (p) => import(pathToFileURL(p).href)
 
 // 插件内部以裸标识符 import '@deepseek-ai/dsh-agent'（上游包的真实依赖关系）。
 // 工作区无 node_modules，故用 Node 官方同步解析钩子把它指到 .recon 里的真实包；
 // 这保证「插件 import 到的 agentEvents」与「冒烟脚本 import 到的」是同一个模块实例。
-const AGENT_ENTRY = `${NM}/dsh-agent/lib/index.js`
+const AGENT_ENTRY = join(NM, 'dsh-agent/lib/index.js')
 registerHooks({
   resolve(spec, ctx, next) {
     if (spec === '@deepseek-ai/dsh-agent') {
@@ -36,10 +40,10 @@ registerHooks({
   },
 })
 
-const { Context } = await imp(`${NM}/cordis/lib/index.js`)
+const { Context } = await imp(join(NM, 'cordis/lib/index.js'))
 const upstreamAgent = await imp(AGENT_ENTRY)
 const { AgentRegistry } = upstreamAgent
-const plug = await imp(`${WS}/index.js`)
+const plug = await imp(join(WS, 'index.js'))
 
 let pass = 0
 let fail = 0

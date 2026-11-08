@@ -1,4 +1,31 @@
+# dsh-engine-switch bundle patch —— 在本 bundle 的层里追加两行，顺序即行序。
+#
+# 1. `engine-switch`：插件本体。它在 apply 时接管 ctx.agents 的 factory slot，
+#    按 forceEngine / agentPreset / marker 决定 create|resume 落到哪个引擎。
+#
+# 2. `preset-pi`：「Pi 引擎」的 Agent preset 声明，让桌面端新建会话的 Preset
+#    下拉菜单里出现这一项。声明形状与 dsh-web-app 自带的 presets/*.patch.yml
+#    逐字同款（同一 `@deepseek-ai/dsh-agent-preset` 行类型，由宿主 profile 的
+#    dsh-agent-preset-registry 收集成 roster）。
+#
+# 两者的接头就是 `config.id`：会话选中的 preset 身份会以
+# `agentPreset` 写进 session header，并在 `ctx.agents.create/resume` 的
+# `options.meta.agentPreset` 上到达插件；插件拿它与自己的 `config.piPreset`
+# （默认 `'pi'`）比对，命中则整段交给 OAR 驱动的 pi 引擎。
+# 所以改这里的 `id` 必须同步改插件的 `piPreset`，否则 UI 选中项不会被接管。
+#
+# `plugins: []` 是 schema 必填项，此处刻意为空：pi 引擎自己就是一个完整 agent
+# （自带循环与工具），这个 preset 不额外组合任何宿主面 child plugin。
 - insert:
     - id: engine-switch
       name: '@local/dsh-engine-switch'
       config: {}
+
+    - id: preset-pi
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: pi
+        name: Pi 引擎
+        description: 本会话由 pi 驱动（经 OAR），使用 pi 自己的循环与工具。
+        order: 20
+        plugins: []
