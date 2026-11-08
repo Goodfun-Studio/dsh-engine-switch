@@ -8,9 +8,15 @@
  *   4. 用 ctx.effect 登记卸载时还原原生 target
  *
  * 路由分流：
- *   - 未打 marker 的调用 → 原样委托暂存的原生 target（零语义变更）
- *   - 带 marker 的调用   → 回声引擎（不调模型），经**真实 DSH 事件设施**发出
- *                          `agent/assistant-stream` 的 start / 瞬态分片 / end 帧
+ *   - 命中 agentPreset / 打了 marker 的调用 → pi 引擎或回声引擎
+ *   - 其余调用                              → 原样委托暂存的原生 target（零语义变更）
+ *
+ * 分流优先级：forceEngine > agentPreset > pi marker > echo marker > 原生 target。
+ *
+ * preset 约定（config.piPreset，缺省 'pi'）：
+ *   options.meta.agentPreset === piPreset  → pi 引擎（真引擎，见 oar-engine.mjs）
+ *   缺失或为别的值（如 'standard'）        → 不触发 preset 分流，回落 marker 判定，
+ *                                            最终原样直通原生 target（负向防误杀）
  *
  * marker 约定（两者自动兼容）：
  *   options.meta.engine === 'echo'  ||  options.engine === 'echo'  → 回声引擎（合成帧）
@@ -47,12 +53,16 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 
+/** agentPreset 命中后路由到 pi 引擎的默认 preset 名（config.piPreset 的默认值）。 */
+export const DEFAULT_PI_PRESET = 'pi'
+
 /**
- * 原样再导出上游真实事件设施，供冒烟脚本做**模块实例同一性**断言：
- * schemastery Config 导出：引擎选择器（forceEngine 枚举）+ 接管证据路径 + 等待超时。
+ * schemastery Config 导出：引擎选择器（forceEngine 枚举）+ agentPreset 名（piPreset）
+ * + 接管证据路径 + 等待超时。
  */
 export const Config = z.object({
   forceEngine: z.union(['native', 'pi', 'echo']).default('native'),
+  piPreset: z.string().default(DEFAULT_PI_PRESET),
   evidencePath: z.string(),
   timeoutMs: z.number().default(10000),
 })
@@ -301,6 +311,40 @@ export function normalizeForceEngine(value) {
 }
 
 /**
+ * 归一化 piPreset 配置：非字符串 / 空串一律回落到默认 'pi'。
+ * 与 forceEngine 的默认语义**刻意相反**：
+ *   - forceEngine 缺省必须「不生效」，否则装了插件就回归；
+ *   - piPreset 缺省必须「可用」，否则 agentPreset 分流永远开不起来。
+ * @param {unknown} value config.piPreset 的原始值
+ * @returns {string} 生效的 pi preset 名（默认 {@link DEFAULT_PI_PRESET}）
+ */
+export function normalizePiPreset(value) {
+  if (typeof value !== 'string') return DEFAULT_PI_PRESET
+  if (value.length === 0) return DEFAULT_PI_PRESET
+  return value
+}
+
+/**
+ * 判定一次 create/resume 调用是否「按 agentPreset 命中 pi」。
+ *
+ * 负向防误杀守卫（本函数是该守卫的唯一定义处）：
+ *   meta 缺失 / meta 非对象 / agentPreset 非字符串 / agentPreset 为空串 /
+ *   agentPreset !== piPreset（例如 'standard'）
+ *   → 一律返回 false，调用方必须原样直通原生 target，绝不碰 pi 引擎。
+ *
+ * @param {unknown} options create/resume 的调用参数
+ * @param {string} piPreset 生效的 pi preset 名
+ * @returns {boolean} true 表示应交给 pi 引擎
+ */
+export function isPiPreset(options, piPreset) {
+  if (options === null || typeof options !== 'object') return false
+  const meta = options.meta
+  if (meta === null || typeof meta !== 'object') return false
+  const agentPreset = meta.agentPreset
+  return typeof agentPreset === 'string' && agentPreset.length > 0 && agentPreset === piPreset
+}
+
+/**
  * 解析「强制路由」：仅当 forceEngine 精确命中已知引擎**且**该引擎实例存在时才生效；
  * 未知值（'pi '、'PI'、'auto'、'pi-lite' …）或引擎缺位一律返回 null，
  * 交由原有 marker 分流处理 —— 保证默认/异常配置下行为与改造前逐字一致。
@@ -315,26 +359,37 @@ export function resolveForcedRoute(forceEngine, engines = {}) {
 }
 
 /**
- * 构造路由器：按 marker 分流到 pi 引擎 / 回声引擎 / 暂存的原生 target。
+ * 构造路由器：按 forceEngine / agentPreset / marker 分流到 pi 引擎 / 回声引擎 / 暂存的原生 target。
  *
- * 分流优先级（本轮新增 forceEngine 顶层强制）：
- *   forceEngine（命中已知引擎时忽略 marker，一律强制） > pi marker > echo marker > 原生 target
- *   forceEngine 为 null（默认）或未命中时，与改造前逐字一致：未打 marker 一律原样委托，零回归。
+ * 分流优先级（本轮新增 agentPreset preset 分流）：
+ *   forceEngine（命中已知引擎时忽略其余判据，一律强制）
+ *     > options.meta.agentPreset === piPreset
+ *     > pi marker > echo marker > 原生 target
  *
- * piEngine 可省略（省略时 pi marker 退化为原生委托，便于未接引擎的单测）。
+ * 三者皆未命中时，与改造前逐字一致：一律原样委托原生 target，零回归。
+ * 负向防误杀：agentPreset 缺失或为别的值（如 'standard'）**不**触发 preset 分流，
+ * 回落 marker 判定，最终直通原生 target —— 判据见 {@link isPiPreset}。
+ *
+ * piEngine 可省略（省略时 preset / pi marker 双双向原生委托，便于未接引擎的单测）。
  *
  * @param {object} nativeTarget 暂存的原生 factory target（含 createAgent/resume）
  * @param {object} echoEngine 回声引擎
  * @param {object} [piEngine] 真实 pi 引擎（pi-engine.mjs 的 createPiEngine）
- * @param {{forceEngine?:string|null, onNative?:Function, onEcho?:Function, onPi?:Function, onPiResult?:Function}} [hooks]
+ * @param {{forceEngine?:string|null, piPreset?:string, onNative?:Function, onEcho?:Function, onPi?:Function, onPiResult?:Function}} [hooks]
  */
 export function createRouter(nativeTarget, echoEngine, piEngine, hooks = {}) {
-  /** forceEngine 生效后的强制路由目标（null = 不强制，走 marker 分流）。 */
+  /** forceEngine 生效后的强制路由目标（null = 不强制，走 preset/marker 分流）。 */
   const forcedRoute = resolveForcedRoute(hooks.forceEngine ?? null, { piEngine, echoEngine })
+  /** 命中即路由到 pi 引擎的 agentPreset 名。 */
+  const piPreset = normalizePiPreset(hooks.piPreset)
   const delegate = (kind, engineCtx, options) => {
     const route =
       forcedRoute ??
-      (isPiMarked(options) ? 'pi' : isEchoMarked(options) ? 'echo' : 'native')
+      (isPiPreset(options, piPreset) || isPiMarked(options)
+        ? 'pi'
+        : isEchoMarked(options)
+          ? 'echo'
+          : 'native')
     const receiver =
       route === 'pi' ? piEngine ?? nativeTarget : route === 'echo' ? echoEngine : nativeTarget
     const notify = hooks[`on${route[0].toUpperCase()}${route.slice(1)}`]
@@ -362,6 +417,7 @@ export function createRouter(nativeTarget, echoEngine, piEngine, hooks = {}) {
     piEngine: piEngine ?? null,
     forceEngine: hooks.forceEngine ?? null,
     forcedRoute,
+    piPreset,
     createAgent(engineCtx, options) {
       return delegate('createAgent', engineCtx, options)
     },
@@ -569,6 +625,8 @@ export function apply(ctx, config = {}) {
   /** forceEngine 配置：默认 null（保持既有 marker 分流，零行为变更）；'pi' 时所有 create/resume 一律交给 pi 引擎。 */
   const forceEngine = normalizeForceEngine(config.forceEngine)
   if (forceEngine !== null) process.env.DSH_ENGINE_SWITCH_FORCE_ENGINE = forceEngine
+  /** agentPreset 分流配置：options.meta.agentPreset 命中该名时一律交给 pi 引擎；缺省 'pi'。 */
+  const piPreset = normalizePiPreset(config.piPreset)
   const store = createEvidenceStore(config)
   const state = {
     installed: null,
@@ -616,6 +674,7 @@ export function apply(ctx, config = {}) {
     })
     const router = createRouter(nativeTarget, echoEngine, piEngine, {
       forceEngine,
+      piPreset,
       onNative: (kind) => store.countNative(kind),
       onEcho: (kind) => store.countEcho(kind),
       onPi: (kind) => store.countPi(kind),
@@ -728,6 +787,7 @@ export function apply(ctx, config = {}) {
     Object.assign(store.evidence, {
       forcedEngine: forceEngine,
       forcedRoute: router.forcedRoute,
+      piPreset: router.piPreset,
       nativeTargetIsAgentLoop: nativeCtor === 'AgentLoop',
       nativeTargetCtorName: nativeCtor,
       nativeTargetEqualsCtxAgentLoop: ctxAgentLoop !== undefined && ctxAgentLoop === nativeTarget,

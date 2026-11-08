@@ -1,4 +1,5 @@
 // force-engine.test.mjs 头部参数化（只改路径定义部分）
+import { registerHooks } from 'node:module'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 

@@ -18,8 +18,13 @@ DESKTOP_LOCK="/Users/ivywu/.dsh/profiles/desktop/pnpm-lock.yaml"
 DESKTOP_PATCH="/Users/ivywu/.dsh/profiles/desktop/cordis.patch.yml"
 
 # 真实 desktop 的基线 sha256（彩排前后必须一致）
-DESKTOP_PKG_SHA="cdd3d4d51d79c3666332b935253a22c27525ddc5aa0c533fe658c8f2a8403e86"
-DESKTOP_LOCK_SHA="783c01daf765dddb22d08c3b0762537df891d29cb628907d628ca65e3a0fcc0c"
+# 基线于 2026-11-08 按真实 desktop 现况刷新（老板确认）。旧值 pkg=cdd3d4d5… /
+# lock=783c01da… 逐字节等于 .rollback-snapshots/desktop/{package.json,pnpm-lock.yaml}.bak
+# （2026-11-08 11:11 快照）。两值之差异经 diff 核实：desktop 此后新装了
+# @local/dsh-engine-switch 与 dsh-context 两个 bundle，属合法变更，故刷新基线。
+# cordis.patch.yml 哈希未变，未动。
+DESKTOP_PKG_SHA="1676854392ce0f159b7f8c8385b2c0c0b394e47e96a5e903c4e3556c257bd13d"
+DESKTOP_LOCK_SHA="5731a54294252a74e93f007c7c1c6d80eabcfa6339216fa20eb78b0d6ebfd2b9"
 DESKTOP_PATCH_SHA="e980f02d1fd586d4bb47d99480e74895e0ea6c4095380cb4aa712f1e528e78fd"
 
 HITS=0
