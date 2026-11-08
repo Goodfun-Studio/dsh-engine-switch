@@ -59,20 +59,27 @@ plugin_manager install_bundle
 | 维度 | 决定什么 | 在哪选 |
 | --- | --- | --- |
 | **Agent Preset**（业务预设） | 系统提示词模板 / 角色 / 工具插件集 | 新建任务页的预设 chip（原生四种：标准 / PTC / 极简 / 创造） |
-| **Engine**（底座引擎） | 底座由谁驱动：DSH 原生 AgentLoop / OAR 驱动的 pi / 回声 | `/engine` 命令、插件设置字段 `engine`、或请求 marker |
+| **Engine**（底座引擎） | 底座由谁驱动：DSH 原生 AgentLoop / OAR 驱动的 pi / 回声 | 主会话框上的「⚡ 引擎」下拉 Chip、`/engine` 命令、插件设置字段 `engine`、或请求 marker |
 
 所以「Pi 引擎」**不在**预设下拉框里（`cordis.patch.yml` 里不再声明任何 preset）。
-引擎走自己的入口，三个都可用：
+引擎走自己的入口，四个都可用：
 
-1. **斜杠命令**（输入区域，推荐）：
+1. **主会话框上的「⚡ 引擎」下拉 Chip**（L6 新增，推荐）：
+   - 位置一：**新会话起始页**那一行右侧，与「工作目录」chip / 预设 chip 同排（`conversation.hero.options`）；
+   - 位置二：**输入框卡片上方**的通栏区右侧，与宿主自己的 Queue / Todo / Goal 同一排（`conversation.input.dock`）；
+   - 点开是屏幕正中的选择面板（挂在 `shell.overlay`），三个选项带一句话说明，当前值带「当前」徽标；
+   - 它写的就是下面第 3 条的 `engine` 字段（走 DSH 通用的 `ctx.remote.settings.update`，带 revision 乐观锁），
+     所以与 `/engine pi` / 设置页改的是**同一个值**；写成功后 Chip 立刻显示新值，
+     外面（设置页 / `/engine`）改值时 Chip 也跟着刷新。
+2. **斜杠命令**（输入区域）：
    ```
    /engine            # 看当前选择器值 / 本会话引擎 / 可选值
    /engine pi         # 切到 Pi 引擎
    /engine native     # 切回原生
    /engine echo       # 回声替身（只回显固定文本，不起模型；联调用）
    ```
-2. **插件设置字段**：`engine` 是 volatile 字段，设置面（设置页 / 插件页）里可以改，改完**即时生效**并写回 profile patch。
-3. **请求级 marker**（headless / ACP / 脚本按次钉死）：`options.meta.engine` 或 `options.engine`，取值 `native` / `pi` / `echo`。
+3. **插件设置字段**：`engine` 是 volatile 字段，设置面（设置页 / 插件页）里可以改，改完**即时生效**并写回 profile patch。
+4. **请求级 marker**（headless / ACP / 脚本按次钉死）：`options.meta.engine` 或 `options.engine`，取值 `native` / `pi` / `echo`。
 
 **判定优先级**（高 → 低，逐条可测，见 `engine-selector.mjs`）：
 
@@ -95,10 +102,11 @@ forceEngine > 请求 marker > 会话已绑定引擎 > agentPreset 兼容命中 >
 **语义边界（如实说明）**：DSH 在「新建任务」那一刻就把 Agent 建好了（preset 之所以能改，是因为它有一等公民的
 `agentPresets/select` remote 做活体换装，第三方插件没有这个口子），所以引擎选择器的语义是
 **「接下来的任务用哪个引擎」**，不是「当前任务换个引擎」。当前会话在它下次被 DSH 重新载入时跟随新选择。
+上面四种入口写的是**同一个权威值**，因此这条边界对四者一视同仁（不能期待点完 Chip 当前会话当场换引擎）。
 
-**尚未实现**：
-- **跨重启的会话→引擎绑定**：绑定表只在进程内；跨重启持久化需要一等公民写入口，见 `ENGINE-SELECTOR-EVIDENCE.md` §选型。
-- **按会话在 UI 里点选引擎**：同因 —— 建 Agent 时才能定引擎，且请求 schema（`SessionCreateRequest`）没有扩展位。
+**还没到「按会话点选」**（诚实边界）：现在能点的是**全局选择器**（= 下一个任务用什么引擎），
+不是「这一条会话换引擎」；后者做不到的原因同上（建 Agent 时才能定引擎，且
+`SessionCreateRequest` 没有给第三方留扩展位）。
 
 ## 回滚机制
 
@@ -124,9 +132,25 @@ bash rollback.sh
 
 ## 开发与测试
 
-本项目包含五个可复跑的测试套件（全部不调模型，除 `endo-pi.sh`）：
+本项目包含六个可复跑的测试套件（全部不调模型，除 `endo-pi.sh`）：
 
-### 1. engine-selector.sh（独立引擎选择器，81 条）
+### 1. client-ui.sh（「⚡ 引擎」客户端 bundle，83 条）
+
+验证 L6 的浏览器半边：`package.json` 的 `dsh.client` 声明与 `exports["./client"]` 能被宿主
+`resolveMeta()` 认出来、模块只依赖平台种子、三个插槽注册正确、取值纪律（近似值不落盘）、
+命名空间定位（含 fork 改名与邻居不误认的负向断言）、写盘参数与 host 拒绝路径，
+并用一个**最小 React 运行时**真的把 `EngineChip` / `EnginePickerOverlay` 渲染出来、真的点：
+
+```bash
+bash client-ui.sh
+```
+
+期望输出：`SYNTAX_OK`、`SUMMARY: 83 HIT / 0 MISS`、`RESULT: PASS`、`CLIENT_UI_DRIVER: OK`、退出码 0。
+
+> 为什么不是「grep client.js」：客户端 bundle 在 **boot 关键路径**上，语法错或 require 到
+> 非平台模块会让整页停在 "Failed to load plugins"；所以这一套真的执行 factory、真的渲染。
+
+### 2. engine-selector.sh（独立引擎选择器，81 条）
 
 验证 Engine ⊥ Preset 的正交组合、判定优先级、会话绑定、`/engine` 命令语法与写盘路径：
 
@@ -136,7 +160,7 @@ bash engine-selector.sh
 
 期望输出：`SUMMARY: 81 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
 
-### 2. smoke.sh（冒烟测试，27 条）
+### 3. smoke.sh（冒烟测试，27 条）
 
 验证接管基础能力与安全模式：
 
@@ -146,7 +170,7 @@ bash smoke.sh
 
 期望输出：`SMOKE_SH: OK`，27 HIT / 0 MISS。
 
-### 3. preset-routing.sh（agentPreset 兼容路由，12 条）
+### 4. preset-routing.sh（agentPreset 兼容路由，12 条）
 
 验证 `meta.agentPreset` 两向分流（含 `standard` / 缺失 meta 的负向断言）：
 
@@ -156,7 +180,7 @@ bash preset-routing.sh
 
 期望输出：`SUMMARY: 12 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
 
-### 4. test-safe-mode.sh（安全模式测试，3 条）
+### 5. test-safe-mode.sh（安全模式测试，3 条）
 
 验证 `DSH_ENGINE_SWITCH_DISABLE=1` 时零影响：
 
@@ -166,7 +190,7 @@ bash test-safe-mode.sh
 
 期望输出：`RESULT: PASS`，3 HIT / 0 MISS。
 
-### 5. endo-pi.sh（端到端 Pi 引擎测试，11 条）
+### 6. endo-pi.sh（端到端 Pi 引擎测试，11 条）
 
 真实驱动 Pi 引擎的完整流程测试：
 
@@ -181,13 +205,18 @@ bash endo-pi.sh
 - 本机 DSH 源码抽取树（`.recon/dsh-src`），用于获取真实契约定义
 - Pi 客户端可正常访问
 
-### 另外两条零成本回归
+### 另外三条零成本回归
 
 ```bash
 node config-check.mjs                      # Config schema 校验（含 engine 字段）
 node --no-warnings force-engine.test.mjs   # forceEngine 优先级与负向断言（20 条）
-bash rehearse-rollback.sh                  # 回滚彩排（16 条，含 DESKTOP_UNTOUCHED）
+bash rehearse-rollback.sh                  # 回滚彩排（20 条，含 DESKTOP_UNTOUCHED + 基线形状哈希边界自证）
 ```
+
+> `rehearse-rollback.sh` 里 desktop `cordis.patch.yml` 的基线是**形状哈希**（只把本插件的
+> `engine:` 一行规范化成 `<volatile>`）：引擎选择器按设计会被老板在 UI 上改，一改就重写 profile patch，
+> 拿字面量当基线会「一用就红」。脚本里另带三条合成样本自证放宽边界（多一行插件必红 /
+> 非法 engine 取值由取值合法性断言接住 / 合法值互换不变）。见 `ENGINE-UI-EVIDENCE.md` §4。
 
 ### 环境变量覆盖
 
@@ -211,6 +240,12 @@ bash rehearse-rollback.sh                  # 回滚彩排（16 条，含 DESKTOP
 5. **引擎选择器是「新任务默认」而不是「当前任务开关」**：引擎只在建 Agent 时能定，见上文的语义边界一节
 6. **会话→引擎绑定只在进程内**：桌面端重启后，存量会话重新按选择器决定引擎（不跨重启记忆会话身份）
 7. **pi 路由目前不把 DSH 历史交给 pi**：换引擎后继续同一会话，pi 只看到本次输入；跨引擎续跑同一会话会丢上下文
+8. **引擎 Chip 改的是全局选择器**：点完不会让当前这条会话当场换引擎（语义边界同上），
+   也不能在 UI 上「按会话」点选 —— 后者需要一等公民的活体换装口，第三方插件没有
+9. **引擎 Chip 只在 Web / 桌面端界面有**：headless / ACP 场景依旧只能靠 `/engine` 或请求 marker
+10. **`endo-pi.sh` 有一条天然会抖的断言**：它要求真模型逐字复述 20 字符随机 token，
+    模型偶发少输出末尾一个字符就会 FAIL（本轮四次运行中失败一次，重跑即绿）。
+    失败时证据 JSON 里的 `piTextLength` / `piTextDeltas` 可用于区分「模型少说」还是「适配器丢分片」
 
 ---
 

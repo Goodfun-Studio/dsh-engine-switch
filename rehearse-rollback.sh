@@ -23,24 +23,26 @@ DESKTOP_PATCH="/Users/ivywu/.dsh/profiles/desktop/cordis.patch.yml"
 # lock=783c01da… 逐字节等于 .rollback-snapshots/desktop/{package.json,pnpm-lock.yaml}.bak
 # （2026-11-08 11:11 快照）。两值之差异经 diff 核实：desktop 此后新装了
 # @local/dsh-engine-switch 与 dsh-context 两个 bundle，属合法变更，故刷新基线。
-# cordis.patch.yml 哈希未变，未动。
 #
-# 【2026-11-09 00:0x 再次刷新 DESKTOP_PATCH_SHA，**只**改了这一个常量】
-# 旧值 e980f02d… 是 2026-11-08 22:08 的快照。此后 23:55 桌面端自身重启时重写了它的
-# profile patch（mtime = 23:55，与 `DeepSeek Harness` 主进程启动时间同一分钟；本轮改动
-# 只动 bundle patch `dsh-engine-switch/cordis.patch.yml`，不碰 desktop profile）。
-# 归因依据：
-#   ① 断言 A 只比对三个文件的 sha256 与字面量常量，完全不经过 index.js；
-#   ② 同一断言里的 package.json / pnpm-lock.yaml 两条仍然 HIT（说明不是整体漂移）；
-#   ③ 断言 G `DESKTOP_UNTOUCHED` 三条全 HIT —— 彩排本身没有改 desktop；
-#   ④ 文件行结构与 2026-11-08 22:08 时读到的完全相同（12 个 `- id:` 行、同样的块），
-#      差异是桌面端自己把 volatile 设置重新序列化后的字节差。
-# 这属于**环境漂移**，需要在真机上继续使用 `settings` 面的任何设置（含本插件的引擎选择器）
-# 都会再触发一次，故这条常量天然是「某一刻的快照」。是否改成「以彩排前实测值为基线」
-# 请老板/上游定夺；本轮只按既有惯例刷新到这个实测值，未动任何断言逻辑。
+# 【2026-11-09 00:0x 上一次刷新 DESKTOP_PATCH_SHA（只改常量）】
+# 值 065021e3… 是 2026-11-08 23:55 桌面端自身重写 profile patch 后的快照。
+#
+# 【2026-11-09 L6 本轮：cordis.patch.yml 从「字面量哈希」改判「形状哈希」】
+# 事实：该文件在 2026-11-09 00:39 又被桌面端重写了一次（raw 065021e3… → 4e2b5e4d…），
+# 且**唯一**的语义差异就是本插件的 `engine: pi`（见下面 §4 的归因取证）。
+# 这不是缺陷，而是本插件设计上的正常行为：`Config.engine` 是 volatile 字段，
+# 设置页 / `/engine` / 本轮的引擎 Chip 每改一次值，profile patch 就重写一次 ——
+# 拿字面量当基线 ⇒ 功能一被使用断言 A 就红，红线失去信号价值（前两轮各自刷新过一次）。
+# 处理（采纳前一轮 §9 里提出、待定的方案）：把 cordis.patch.yml 的基线改成
+# **形状哈希** —— 只把 `engine-switch` 条目里的 `engine:` 值规范化成 `<volatile>` 再取 sha256，
+# 另外**单独断言**该值 ∈ {native,pi,echo,缺省}。规范化只覆盖这一行：
+# 新增/删除插件行、改别的 config、改别的值 ⇒ 形状哈希照样变 ⇒ 仍会 MISS。
+# package.json / pnpm-lock.yaml 两条基线仍是字面量，未动。
 DESKTOP_PKG_SHA="1676854392ce0f159b7f8c8385b2c0c0b394e47e96a5e903c4e3556c257bd13d"
 DESKTOP_LOCK_SHA="5731a54294252a74e93f007c7c1c6d80eabcfa6339216fa20eb78b0d6ebfd2b9"
-DESKTOP_PATCH_SHA="065021e3db26e61e6da59ba217ff5488e7300fc70c0f9a919f2aaea6600bb431"
+DESKTOP_PATCH_CANON_SHA="87661f12040b227f74cff670ebba49fd5a36ce3977917b572c9031daf1607987"
+# 形状基线建立时的实测 raw sha256（仅供人眼核对：本次改判前的那一份）
+DESKTOP_PATCH_RAW_AT_BASELINE="4e2b5e4d0d3e7de35ce7baeb4b81cccd9b5c81d6d75ec5619563f00d269c1233"
 
 HITS=0
 MISSES=0
@@ -57,6 +59,28 @@ miss() {
 
 sha256_file() {
   shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# 读 desktop profile patch 里本插件的 volatile 选择器值，并给出「形状哈希」：
+# 只把 `engine-switch` 条目里的 `engine:` 一行规范化成 `<volatile>`，其余逐字节保留。
+# 输出：`<engine 取值> <形状 sha256>`
+patch_shape_report() {
+  node -e '
+const fs = require("node:fs")
+const crypto = require("node:crypto")
+const lines = fs.readFileSync(process.argv[1], "utf8").split("\n")
+let start = -1
+let end = lines.length
+for (let i = 0; i < lines.length; i++) if (/^- id:\s*engine-switch\s*(#.*)?$/.test(lines[i])) { start = i; break }
+if (start >= 0) for (let i = start + 1; i < lines.length; i++) if (/^- id:/.test(lines[i])) { end = i; break }
+let engine = "<absent>"
+const out = lines.slice()
+if (start >= 0) for (let i = start; i < end; i++) {
+  const match = /^(\s*)engine:\s*(\S+)\s*$/.exec(lines[i])
+  if (match !== null) { engine = match[2]; out[i] = match[1] + "engine: <volatile>" }
+}
+process.stdout.write(engine + " " + crypto.createHash("sha256").update(out.join("\n")).digest("hex") + "\n")
+' "$1"
 }
 
 echo "=== 回滚机制彩排 ==="
@@ -80,11 +104,56 @@ else
   miss "desktop/pnpm-lock.yaml 基线不一致: 期望 $DESKTOP_LOCK_SHA, 实际 $BEFORE_LOCK"
 fi
 
-if [[ "$BEFORE_PATCH" == "$DESKTOP_PATCH_SHA" ]]; then
-  hit "desktop/cordis.patch.yml 基线一致: $BEFORE_PATCH"
+# cordis.patch.yml：形状哈希（engine 选择器值按设计会浮动，见文件头注释）
+read -r PATCH_ENGINE PATCH_CANON_SHA <<< "$(patch_shape_report "$DESKTOP_PATCH")"
+
+if [[ "$PATCH_CANON_SHA" == "$DESKTOP_PATCH_CANON_SHA" ]]; then
+  hit "desktop/cordis.patch.yml 形状基线一致（engine 值规范化后）: canon=$PATCH_CANON_SHA engine=$PATCH_ENGINE raw=$BEFORE_PATCH"
 else
-  miss "desktop/cordis.patch.yml 基线不一致: 期望 $DESKTOP_PATCH_SHA, 实际 $BEFORE_PATCH"
+  miss "desktop/cordis.patch.yml 形状基线不一致: 期望 canon=$DESKTOP_PATCH_CANON_SHA, 实际 canon=$PATCH_CANON_SHA（engine=$PATCH_ENGINE raw=$BEFORE_PATCH）"
 fi
+
+if [[ "$PATCH_ENGINE" == "native" || "$PATCH_ENGINE" == "pi" || "$PATCH_ENGINE" == "echo" || "$PATCH_ENGINE" == "<absent>" ]]; then
+  hit "desktop/cordis.patch.yml 的 engine 取值合法（native|pi|echo|缺省）: $PATCH_ENGINE"
+else
+  miss "desktop/cordis.patch.yml 的 engine 取值非法（不是三个精确取值之一）: $PATCH_ENGINE"
+fi
+
+# 断言 A2：形状哈希的**边界自证** —— 证明放宽的**只有**「engine 取值」这一个维度。
+# 三个合成样本：新增插件行、把 engine 改成非法值 ⇒ 必须变（仍会红）；
+# 只换一个合法 engine 值 ⇒ 必须不变（本插件功能被使用，不该红）。
+SHAPE_PROBE="$(mktemp -d "${TMPDIR:-/tmp}/dsh-patch-shape.XXXXXX")"
+node -e '
+const fs = require("node:fs")
+const text = fs.readFileSync(process.argv[1], "utf8")
+const dir = process.argv[2]
+// 变量一：多一行插件（结构变了）
+fs.writeFileSync(dir + "/extra-row.yml", text + "- id: probe-plugin\n  name: \"@local/probe\"\n  config: {}\n")
+// 变量二：engine 改成非法值
+fs.writeFileSync(dir + "/bad-engine.yml", text.replace(/\n    engine: \S+\n/, "\n    engine: v8\n"))
+// 变量三：只换一个合法 engine 值（设计上应该放行的那个维度）
+fs.writeFileSync(dir + "/swapped-engine.yml", text.replace(/\n    engine: \S+\n/, "\n    engine: echo\n"))
+' "$DESKTOP_PATCH" "$SHAPE_PROBE"
+
+read -r PROBE_EXTRA_ROWS_ENGINE PROBE_EXTRA_ROWS_SHA <<< "$(patch_shape_report "$SHAPE_PROBE/extra-row.yml")"
+read -r PROBE_BAD_ENGINE PROBE_BAD_SHA <<< "$(patch_shape_report "$SHAPE_PROBE/bad-engine.yml")"
+read -r PROBE_SWAPPED_ENGINE PROBE_SWAPPED_SHA <<< "$(patch_shape_report "$SHAPE_PROBE/swapped-engine.yml")"
+if [[ "$PROBE_EXTRA_ROWS_SHA" != "$DESKTOP_PATCH_CANON_SHA" ]]; then
+  hit "形状哈希边界自证①：新增一行插件（结构变了）⇒ 形状哈希必变（仍会红）: canon=$PROBE_EXTRA_ROWS_SHA"
+else
+  miss "形状哈希边界自证①失败：多了一行插件形状哈希竟然没变（放宽过度）: canon=$PROBE_EXTRA_ROWS_SHA"
+fi
+if [[ "$PROBE_BAD_SHA" == "$DESKTOP_PATCH_CANON_SHA" && "$PROBE_BAD_ENGINE" == "v8" ]]; then
+  hit "形状哈希边界自证②：engine 取值被规范化（哈希盲于取值，设计如此），但取值仍被逐字读出（v8）⇒ 由「取值合法」那条断言接住"
+else
+  miss "形状哈希边界自证②失败: canon=$PROBE_BAD_SHA engine=$PROBE_BAD_ENGINE"
+fi
+if [[ "$PROBE_SWAPPED_SHA" == "$DESKTOP_PATCH_CANON_SHA" && "$PROBE_SWAPPED_ENGINE" == "echo" ]]; then
+  hit "形状哈希边界自证③：只换一个合法 engine 值（pi → echo）⇒ 形状哈希不变（放行的就是这一个维度）"
+else
+  miss "形状哈希边界自证③失败：合法 engine 值互换竟然变了形状 canon=$PROBE_SWAPPED_SHA engine=$PROBE_SWAPPED_ENGINE"
+fi
+rm -rf "$SHAPE_PROBE"
 
 echo ""
 

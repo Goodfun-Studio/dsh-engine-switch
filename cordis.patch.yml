@@ -13,10 +13,14 @@
 # pi / 回声）。把引擎降格成「预设的一种」，等于每多一个引擎就往「标准模式 / 创造模式」
 # 那一列里塞一项 —— 两个正交维度被焊死在一起。
 #
-# 现在引擎走自己的三个入口（都与 preset 下拉框无关）：
+# 现在引擎走自己的四个入口（都与 preset 下拉框无关）：
 #   ① 斜杠命令 `/engine [native|pi|echo]`（输入区域；host 侧注册，见 engine-command.mjs）
 #   ② 本插件自己的配置字段 `engine`（volatile ⇒ 设置页可编辑、实时生效、写回 profile patch）
 #   ③ 请求级 marker（`options.meta.engine` / `options.engine`，给 headless / ACP / 脚本按次钉死）
+#   ④ **主会话框上的「⚡ 引擎」下拉 Chip**（客户端半边 client.js：新会话起始页
+#      `conversation.hero.options` 与输入框上方 `conversation.input.dock` 各一枚，
+#      点开是 `shell.overlay` 里的选择面板）——它写的就是 ② 的那个值，
+#      走 DSH 通用的 `ctx.remote.settings.update`，不是第二套权威。
 #
 # 于是「创造模式 + Pi 引擎」「标准模式 + Pi 引擎」都是合法且独立的组合：preset 照旧在
 # 新建任务页的预设 chip 里选（原生四种业务模式），engine 在上面任一入口选。
@@ -26,8 +30,13 @@
 # pi 引擎 —— 会话自己的身份优先于全局缺省，见 engine-intent.mjs 的优先级表。
 #
 # `Config.engine` 是 volatile 字段，所以 settings 会把本 entry 的 id（`engine-switch`）
-# 当作命名空间暴露出来；桌面端设置页与 `/engine` 命令改的是同一个值（profile
+# 当作命名空间暴露出来；桌面端设置页 / `/engine` 命令 / 上面的「⚡ 引擎」Chip 改的都是同一个值（profile
 # cordis.patch.yml 里的 `engine-switch: { engine: ... }`）。
+#
+# 浏览器半边（client.js）由本包的 `dsh.client` 声明 + `exports["./client"]` 交给
+# dsh-client-modules 组装进 boot 图；它只 require 平台种子 react / react/jsx-runtime，
+# 且**不**硬 inject `remote.settings`（可选依赖走 ctx.get 现取：拿不到就渲染「不可用」，
+# 不让本条目 pending —— 客户端条目 pending 会把整页卡在 "Failed to load plugins"）。
 - insert:
     - id: engine-switch
       name: '@local/dsh-engine-switch'
