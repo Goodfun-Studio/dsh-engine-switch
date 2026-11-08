@@ -28,13 +28,43 @@ plugin_manager install_bundle
 
 在安装路径输入时，提供本插件的**绝对目录路径**（如 `/path/to/dsh-engine-switch`）。
 
+## 依赖约定（决定能不能在别的机器上装）
+
+| 包 | 声明 | 谁来提供 |
+| --- | --- | --- |
+| `@deepseek-ai/*`（schemastery、cordis、dsh-agent、dsh-llm、dsh-session、dsh-agent-loop） | `peerDependencies` | 宿主 DSH profile（profile 的 `pnpm-workspace.yaml` 设了 `autoInstallPeers: false`，不随插件安装） |
+| `@botiverse/oar` | `dependencies`（`^0.95.0`） | 插件自身，正常安装 |
+
+`@deepseek-ai/*` 的版本区间统一是：
+
+```
+>=0.2.0-0 || >=0.2.1-0 || >=0.2.2-0
+```
+
+- **绝不**把 `@deepseek-ai/*` 写回 `file:<本机绝对路径>`：那会把插件绑死在作者本机的 DSH 源码抽取树上，
+  别的机器 `install_bundle` 必然失败（本仓库首个 commit 的「已知问题」讲的就是这件事）。
+- 区间里的 `||` 链是 semver 的 prerelease 写法，不是啰嗦：单个 `>=0.2.0-0` 按 npm semver 规则
+  **不匹配** 0.2.2-rc.1（prerelease 版本只有 major.minor.patch 完全相同的 comparator 才放行），
+  换成 `*` 则会去 registry 取 `latest`（= 0.1.0-rc.6 旧版宿主）。`||` 链与官方 `dsh-context` 同款：
+  放行 0.2.0/0.2.1/0.2.2 的 prerelease 与之后全部稳定版，不放过 0.1.x。
+- 本仓库 `node_modules/@deepseek-ai/*` 是指向 `.recon/dsh-src` 的开发期软链（本地态，不入库）。
+  在仓库根跑 `npm install` 会把这几条本机软链写进 `package-lock.json`，把机器相关路径又带回来；
+  `package-lock.json` 只应在**干净环境**（无本地软链）用 `npm install --package-lock-only` 重算，
+  或直接 `npm ci` 按 lock 从 registry 装（该 lock 已与宿主同版本：0.2.2-rc.1 / cordis 4.1.0 / schemastery 3.19.0）。
+
 ## 如何选引擎
 
-**当前只支持强制全局引擎选择**：通过 `cordis.patch.yml` 中的 `config.forceEngine` 字段指定引擎（如 `pi`）。
+两条路都已可用：
+
+1. **按 agentPreset 自动路由**：create/resume 带 `options.meta.agentPreset`，且其值等于
+   `config.piPreset`（默认 `'pi'`）时，本次调用交给 pi 引擎；缺失、非字符串、空串或为别的值
+   （如 `'standard'`）一律走原生 target（负向防误杀，可复跑见 `preset-routing.mjs` / `preset-routing.sh`）。
+2. **强制全局引擎**：`cordis.patch.yml` 的 `config.forceEngine` 字段（如 `pi`）。
+
+优先级：`forceEngine` > `agentPreset` > pi marker > echo marker > 原生 target。
 
 **尚未实现的功能**：
-- **按会话选引擎**：根据用户在会话创建时的参数动态选择引擎
-- **按 preset 选引擎**：根据 agent preset ID 自动路由到对应引擎
+- **按会话选引擎**：根据会话创建时的其他参数（非 agentPreset）动态选择引擎
 
 这些特性计划在后续版本中实现。
 
