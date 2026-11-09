@@ -18,13 +18,13 @@
     - id: engine-switch-real-pi
       name: ./index.js
       config:
-        evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject/real-pi-evidence.json
+        evidencePath: ${DSH_INJECT_DIR}/real-pi-evidence.json
         forceEngine: pi
         pi:
-          agentDir: /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch/.pi-agent
+          agentDir: ${PI_AGENT_DIR}
           prompt: "reply with exactly: CONFIG_FALLBACK"
           timeoutMs: 45000
           provider: magpie
           model: auto/deepseek-v4.1-flash
-          cliPath: /Users/ivywu/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
-          cwd: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject
+          cliPath: ${PI_CLI_PATH}
+          cwd: ${DSH_INJECT_DIR}

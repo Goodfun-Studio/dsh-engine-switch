@@ -48,7 +48,10 @@ export DSH_HOME="$ROOT/.recon/dsh-session-home"
 REAL_DSH="${HOME}/.dsh"
 PROFILE_NAME="testweb"
 PROFILE_DIR="$DSH_HOME/profiles/$PROFILE_NAME"
-PATCH="$SWITCH/real-pi-web-patch.yml"
+PATCH_TEMPLATE="$SWITCH/real-pi-web-patch.yml"
+PATCH="$INJECT_DIR/web-pi-patch.yml"
+PI_AGENT_DIR="${PI_AGENT_DIR:-$SWITCH/.pi-agent}"
+PI_CLI_PATH="${PI_CLI_PATH:-$HOME/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js}"
 EVIDENCE="$INJECT_DIR/web-session-evidence.json"
 LOG="$INJECT_DIR/endo-session-host.log"
 PORT="${PORT:-0}"   # 0 = 让宿主自己挑空闲端口（避免与残留进程抢端口）
@@ -75,10 +78,15 @@ echo "PORT=$PORT"
 echo
 
 [ -f "$CLI" ] || { echo "FATAL: CLI not found: $CLI"; exit 2; }
-[ -f "$PATCH" ] || { echo "FATAL: patch not found: $PATCH"; exit 2; }
+[ -f "$PATCH_TEMPLATE" ] || { echo "FATAL: patch template not found: $PATCH_TEMPLATE"; exit 2; }
 [ -f "$SWITCH/index.js" ] || { echo "FATAL: plugin entry not found"; exit 2; }
 
 mkdir -p "$INJECT_DIR"
+sed -e "s#\${DSH_INJECT_DIR}#$INJECT_DIR#g" \
+    -e "s#\${PI_AGENT_DIR}#$PI_AGENT_DIR#g" \
+    -e "s#\${PI_CLI_PATH}#$PI_CLI_PATH#g" \
+    -e "s#name: \./index.js#name: $SWITCH/index.js#" \
+    "$PATCH_TEMPLATE" > "$PATCH"
 
 # ---------- magpie key 传递（不落盘、不打印；与 endo-pi.sh 逐字同源） ----------
 KEY_ENV="DSH_PI_SMOKE_MAGPIE_KEY"

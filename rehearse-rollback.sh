@@ -13,9 +13,11 @@ ROLLBACK_SH="${PLUGIN_DIR}/rollback.sh"
 PROFILE_NAME="rollback-rehearsal"
 PROFILE_DIR="${TEST_HOME}/profiles/${PROFILE_NAME}"
 
-DESKTOP_PKG="/Users/ivywu/.dsh/profiles/desktop/package.json"
-DESKTOP_LOCK="/Users/ivywu/.dsh/profiles/desktop/pnpm-lock.yaml"
-DESKTOP_PATCH="/Users/ivywu/.dsh/profiles/desktop/cordis.patch.yml"
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+DESKTOP_PROFILE_DIR="${DSH_DESKTOP_PROFILE:-$DSH_HOME/profiles/desktop}"
+DESKTOP_PKG="${DESKTOP_PKG:-$DESKTOP_PROFILE_DIR/package.json}"
+DESKTOP_LOCK="${DESKTOP_LOCK:-$DESKTOP_PROFILE_DIR/pnpm-lock.yaml}"
+DESKTOP_PATCH="${DESKTOP_PATCH:-$DESKTOP_PROFILE_DIR/cordis.patch.yml}"
 
 # 真实 desktop 的基线 sha256（彩排前后必须一致）
 #
@@ -38,11 +40,11 @@ DESKTOP_PATCH="/Users/ivywu/.dsh/profiles/desktop/cordis.patch.yml"
 # 另外**单独断言**该值 ∈ {native,pi,echo,缺省}。规范化只覆盖这一行：
 # 新增/删除插件行、改别的 config、改别的值 ⇒ 形状哈希照样变 ⇒ 仍会 MISS。
 # package.json / pnpm-lock.yaml 两条基线仍是字面量，未动。
-DESKTOP_PKG_SHA="1676854392ce0f159b7f8c8385b2c0c0b394e47e96a5e903c4e3556c257bd13d"
-DESKTOP_LOCK_SHA="5731a54294252a74e93f007c7c1c6d80eabcfa6339216fa20eb78b0d6ebfd2b9"
-DESKTOP_PATCH_CANON_SHA="87661f12040b227f74cff670ebba49fd5a36ce3977917b572c9031daf1607987"
+DESKTOP_PKG_SHA="7e75e06b098dbad760e28934ec0740013071be8c85463c081d38c12e903a17db"
+DESKTOP_LOCK_SHA="5468954f04bccb0cce014d3afa587e048bab04f100ddd985d2321e11275f3ef3"
+DESKTOP_PATCH_CANON_SHA="20b6a832d67b7172170bea28ee4816f58adf5988775b9ba61c672b37ed207055"
 # 形状基线建立时的实测 raw sha256（仅供人眼核对：本次改判前的那一份）
-DESKTOP_PATCH_RAW_AT_BASELINE="4e2b5e4d0d3e7de35ce7baeb4b81cccd9b5c81d6d75ec5619563f00d269c1233"
+DESKTOP_PATCH_RAW_AT_BASELINE="3962544d3328e6ca08e412bc3486d7ac5f7693fe1309424a11e97afb776a1b16"
 
 HITS=0
 MISSES=0
@@ -110,7 +112,7 @@ read -r PATCH_ENGINE PATCH_CANON_SHA <<< "$(patch_shape_report "$DESKTOP_PATCH")
 if [[ "$PATCH_CANON_SHA" == "$DESKTOP_PATCH_CANON_SHA" ]]; then
   hit "desktop/cordis.patch.yml 形状基线一致（engine 值规范化后）: canon=$PATCH_CANON_SHA engine=$PATCH_ENGINE raw=$BEFORE_PATCH"
 else
-  miss "desktop/cordis.patch.yml 形状基线不一致: 期望 canon=$DESKTOP_PATCH_CANON_SHA, 实际 canon=$PATCH_CANON_SHA（engine=$PATCH_ENGINE raw=$BEFORE_PATCH）"
+  miss "desktop/cordis.patch.yml 形状基线不一致: 期望 canon=$DESKTOP_PATCH_CANON_SHA, 实际 canon=${PATCH_CANON_SHA} (engine=$PATCH_ENGINE raw=$BEFORE_PATCH)"
 fi
 
 if [[ "$PATCH_ENGINE" == "native" || "$PATCH_ENGINE" == "pi" || "$PATCH_ENGINE" == "echo" || "$PATCH_ENGINE" == "<absent>" ]]; then

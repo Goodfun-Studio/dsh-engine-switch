@@ -19,12 +19,12 @@
     - id: engine-switch-web-pi
       name: ./index.js
       config:
-        evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-session-inject/web-session-evidence.json
+        evidencePath: ${DSH_INJECT_DIR}/web-session-evidence.json
         engine: pi
         pi:
-          agentDir: /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch/.pi-agent
+          agentDir: ${PI_AGENT_DIR}
           timeoutMs: 60000
           provider: magpie
           model: auto/deepseek-v4.1-flash
-          cliPath: /Users/ivywu/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
-          cwd: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-session-inject
+          cliPath: ${PI_CLI_PATH}
+          cwd: ${DSH_INJECT_DIR}

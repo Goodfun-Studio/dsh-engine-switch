@@ -34,7 +34,10 @@ REAL_DSH="${HOME}/.dsh"
 PROFILE_NAME="testh"
 PROFILE_DIR="$DSH_HOME/profiles/$PROFILE_NAME"
 
-PATCH="$SWITCH/real-pi-patch.yml"
+PATCH_TEMPLATE="$SWITCH/real-pi-patch.yml"
+PATCH="$INJECT_DIR/real-pi-patch.yml"
+PI_AGENT_DIR="${PI_AGENT_DIR:-$SWITCH/.pi-agent}"
+PI_CLI_PATH="${PI_CLI_PATH:-$HOME/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js}"
 EVIDENCE="$INJECT_DIR/real-pi-evidence.json"
 LOG="$INJECT_DIR/endo-pi-run.log"
 TASK="${TASK:-reply with exactly: PI_OK}"   # 可被外部覆盖
@@ -57,6 +60,11 @@ if [ -z "${!KEY_ENV:-}" ] && [ -f "$HOME/.pi/agent/models.json" ]; then
 fi
 
 mkdir -p "$INJECT_DIR"
+sed -e "s#\${DSH_INJECT_DIR}#$INJECT_DIR#g" \
+    -e "s#\${PI_AGENT_DIR}#$PI_AGENT_DIR#g" \
+    -e "s#\${PI_CLI_PATH}#$PI_CLI_PATH#g" \
+    -e "s#name: \./index.js#name: $SWITCH/index.js#" \
+    "$PATCH_TEMPLATE" > "$PATCH"
 TMPD="$(mktemp -d 2>/dev/null || mktemp -d -t endopi)"
 cleanup(){ rm -rf "$TMPD"; }
 trap cleanup EXIT

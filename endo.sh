@@ -10,9 +10,9 @@
 # 用法：bash /path/to/dsh-engine-switch/endo.sh
 set -uo pipefail
 
-WS="/Users/ivywu/Documents/deepseek-harness/default-workspace"
+WS="${DSH_WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
 SWITCH="$WS/dsh-engine-switch"
-CLI="$WS/.recon/dsh-src/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
+CLI="${DSH_CLI:-$WS/.recon/dsh-src/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js}"
 INJECT_DIR="$WS/.recon/dsh-real-inject"
 # 上游真实包所在（本地已解出的 dsh-desktop-runtime 依赖树；只做符号链接，绝不安装/联网）
 UPSTREAM_AI="$WS/.recon/dsh-src/dsh/node_modules/@deepseek-ai"
@@ -23,7 +23,8 @@ REAL_DSH="${HOME}/.dsh"
 PROFILE_NAME="testh"
 PROFILE_DIR="$DSH_HOME/profiles/$PROFILE_NAME"
 
-PATCH="$SWITCH/real-takeover-patch.yml"
+PATCH_TEMPLATE="$SWITCH/real-takeover-patch.yml"
+PATCH="$INJECT_DIR/patch-real-takeover.yml"
 EVIDENCE="$INJECT_DIR/real-takeover-evidence.json"
 LOG="$INJECT_DIR/endo-run.log"
 
@@ -43,8 +44,11 @@ echo
 
 # ---------- 前置检查（缺件则如实失败，不伪造） ----------
 [ -f "$CLI" ]  || { echo "FATAL: CLI not found: $CLI"; exit 2; }
-[ -f "$PATCH" ]|| { echo "FATAL: patch not found: $PATCH"; exit 2; }
+[ -f "$PATCH_TEMPLATE" ]|| { echo "FATAL: patch template not found: $PATCH_TEMPLATE"; exit 2; }
 [ -f "$SWITCH/index.js" ] || { echo "FATAL: plugin entry not found: $SWITCH/index.js"; exit 2; }
+
+mkdir -p "$INJECT_DIR"
+sed -e "s#\${DSH_INJECT_DIR}#$INJECT_DIR#g" -e "s#name: \./index.js#name: $SWITCH/index.js#" "$PATCH_TEMPLATE" > "$PATCH"
 
 # ---------- 运行时依赖解析作用域（唯一新增的可选准备步骤，可由 DSH_SWITCH_SKIP_LINK=1 跳过） ----------
 # 外挂目录原不在 profiles 树内，上游 ESM 加载器对其裸导入不做重写；

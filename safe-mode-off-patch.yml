@@ -2,5 +2,5 @@
   - id: engine-switch-safe-off
     name: ./index.js
     config:
-      evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject/safe-mode-off-evidence.json
+      evidencePath: ${DSH_INJECT_DIR}/safe-mode-off-evidence.json
       forceEngine: pi

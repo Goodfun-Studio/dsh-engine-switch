@@ -23,8 +23,8 @@ PROFILE_NAME="testh-safe"
 PROFILE_DIR="$DSH_HOME/profiles/$PROFILE_NAME"
 
 # 两次测试各用独立 patch 与 evidence
-PATCH_OFF="$SWITCH/safe-mode-off-patch.yml"
-PATCH_ON="$SWITCH/safe-mode-on-patch.yml"
+PATCH_OFF="$INJECT_DIR/safe-mode-off-patch.yml"
+PATCH_ON="$INJECT_DIR/safe-mode-on-patch.yml"
 EVIDENCE_OFF="$INJECT_DIR/safe-mode-off-evidence.json"
 EVIDENCE_ON="$INJECT_DIR/safe-mode-on-evidence.json"
 LOG_OFF="$INJECT_DIR/safe-mode-off-run.log"
@@ -84,7 +84,7 @@ echo "--- prepare patch files ---"
 cat > "$PATCH_OFF" <<EOF_OFF
 - insert:
   - id: engine-switch-safe-off
-    name: ./index.js
+    name: $SWITCH/index.js
     config:
       evidencePath: $INJECT_DIR/safe-mode-off-evidence.json
       forceEngine: pi
@@ -95,7 +95,7 @@ echo "  created: $PATCH_OFF"
 cat > "$PATCH_ON" <<EOF_ON
 - insert:
   - id: engine-switch-safe-on
-    name: ./index.js
+    name: $SWITCH/index.js
     config:
       evidencePath: $INJECT_DIR/safe-mode-on-evidence.json
 EOF_ON

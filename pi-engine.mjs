@@ -6,7 +6,7 @@
  *   `agent/assistant-stream` 三类帧（start / ≥1 分片 / end）。
  *
  * 事实依据（均可复核，未重新探索）：
- *   - pi 包：/Users/ivywu/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent（v1.4.0）
+ *   - pi 包：~/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent（v1.4.0）
  *     main = ./dist/index.js，导出面含 RpcClient（官方 subprocess 客户端）；
  *     ./dist/cli.js 是 RpcClient 示例里指向的 CLI 入口（examples/rpc-client.ts）。
  *   - docs/rpc.md：严格 JSONL 框架、prompt 响应的 disposition、`agent_settled` 才是运行边界、
@@ -40,6 +40,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { agentEvents, emitAgentEvent } from '@deepseek-ai/dsh-agent'
 
@@ -59,8 +60,11 @@ export const PI_PROMPT = 'Reply with exactly this token and nothing else: PI_OK'
 export const PI_OK_MARKER = 'PI_OK'
 
 /** pi 包目录（绝对路径；worker cwd 不是工作区，全程绝对路径）。 */
-export const PI_PKG_DIR =
-  '/Users/ivywu/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent'
+const DEFAULT_PI_PKG_DIR = join(
+  homedir(),
+  '.npm-global/lib/node_modules/@earendil-works/pi-coding-agent',
+)
+export const PI_PKG_DIR = process.env.PI_PKG_DIR || DEFAULT_PI_PKG_DIR
 
 /** pi 包主入口（RpcClient 从这里官方导出）。 */
 export const PI_MODULE_PATH = `${PI_PKG_DIR}/dist/index.js`
@@ -69,7 +73,8 @@ export const PI_MODULE_PATH = `${PI_PKG_DIR}/dist/index.js`
 export const PI_CLI_PATH = `${PI_PKG_DIR}/dist/cli.js`
 
 /** 用户实际敲的 pi 可执行文件（symlink → dist/bundle/cli.js），仅作证据核对。 */
-export const PI_BIN_PATH = '/Users/ivywu/.npm-global/bin/pi'
+const DEFAULT_PI_BIN_PATH = join(homedir(), '.npm-global/bin/pi')
+export const PI_BIN_PATH = process.env.PI_BIN_PATH || DEFAULT_PI_BIN_PATH
 
 /** 传给 pi 子进程的 --name（唯一 tag，供 smoke 用 pgrep 断言「无残留子进程」）。 */
 export const PI_CHILD_TAG = 'engine-switch-pi-smoke'
@@ -309,7 +314,8 @@ export const PI_SEED_SYMLINK_DIRS = Object.freeze([
  * @returns {{target:string, symlinkedNames:string[], derivedNames:string[], apiKeyRefStyle:string, maxTokensApplied:number|null, bytesWritten:number, reused:boolean}}
  */
 export function seedAgentDir(opts = {}) {
-  const source = opts.source ?? '/Users/ivywu/.pi/agent'
+  const defaultSource = process.env.PI_AGENT_DIR || join(homedir(), '.pi/agent')
+  const source = opts.source ?? defaultSource
   const target = opts.target
   if (!target) throw new Error('seedAgentDir: target 必填（必须是工作区内可写目录）')
   const modelId = opts.modelId ?? PI_DEFAULT_MODEL

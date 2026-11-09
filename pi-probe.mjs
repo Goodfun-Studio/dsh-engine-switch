@@ -1,5 +1,6 @@
 // pi-probe.mjs 头部参数化（只改路径定义部分）
 import { pathToFileURL, fileURLToPath } from 'node:url'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -26,13 +27,14 @@ registerHooks({
 // 真实 pi 包 / 配置目录常量（与已验证的探针逐字一致）
 // ---------------------------------------------------------------------------
 const PI_PKG_DIR =
-  '/Users/ivywu/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent'
+  process.env.PI_PKG_DIR ||
+  join(homedir(), '.npm-global/lib/node_modules/@earendil-works/pi-coding-agent')
 const AGENT_DIR = `${WS}/.pi-agent`
 const KEY_VAR = 'DSH_PI_SMOKE_MAGPIE_KEY'
 
 // 从宿主配置里取 magpie 的 key（**不打印**），以环境变量形式注入子进程。
 if (!process.env[KEY_VAR]) {
-  const host = '/Users/ivywu/.pi/agent/models.json'
+  const host = process.env.PI_MODELS_PATH || join(homedir(), '.pi/agent/models.json')
   if (existsSync(host)) {
     const j = JSON.parse(readFileSync(host, 'utf8'))
     const k = j?.providers?.magpie?.apiKey

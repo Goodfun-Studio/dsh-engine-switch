@@ -64,7 +64,7 @@ jq '.dsh.profile.bundles' ~/.dsh/profiles/<profile-name>/package.json
 **步骤 1：装入前快照**
 ```bash
 # 在装入插件前执行
-cd /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch
+cd /path/to/dsh-engine-switch
 ./rollback.sh snapshot --profile <profile-name>
 
 # 可选：指定非默认 DSH_HOME
@@ -73,12 +73,12 @@ cd /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch
 
 **步骤 2：装入插件**
 ```bash
-dsh plugin --profile <profile-name> add /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch
+dsh plugin --profile <profile-name> add /path/to/dsh-engine-switch
 ```
 
 **步骤 3：失效后还原**
 ```bash
-cd /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch
+cd /path/to/dsh-engine-switch
 ./rollback.sh restore --profile <profile-name>
 
 # 验证还原结果（sha256 应与快照前一致）
@@ -104,7 +104,7 @@ shasum -a 256 ~/.dsh/profiles/<profile-name>/pnpm-lock.yaml
 ### 使用方法
 
 ```bash
-cd /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch
+cd /path/to/dsh-engine-switch
 
 # 运行彩排脚本
 ./rehearse-rollback.sh
@@ -172,7 +172,7 @@ MISSES: 0
 
 1. **彩排验证**（已完成 ✅）
    ```bash
-   cd /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch
+   cd /path/to/dsh-engine-switch
    ./rehearse-rollback.sh
    # 确认退出码 0，全 HIT
    ```
@@ -184,7 +184,7 @@ MISSES: 0
 
 3. **装入插件**
    ```bash
-   dsh plugin --profile desktop add /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch
+   dsh plugin --profile desktop add /path/to/dsh-engine-switch
    ```
 
 4. **测试验证**

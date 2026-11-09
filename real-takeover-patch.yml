@@ -13,4 +13,4 @@
     - id: engine-switch-real
       name: ./index.js
       config:
-        evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-real-inject/real-takeover-evidence.json
+        evidencePath: ${DSH_INJECT_DIR}/real-takeover-evidence.json
