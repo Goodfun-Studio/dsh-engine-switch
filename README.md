@@ -25,7 +25,8 @@ Pi 引擎    （预留其他引擎）
 | `index.js` | 插件入口：接管 `ctx.agents.factory`、路由器接线、事件桥、证据落盘 |
 | `engine-intent.mjs` | 引擎意图判定（forceEngine / marker / 会话绑定 / preset 兼容 / 选择器 / 默认） |
 | `engine-command.mjs` | `/engine` 命令的语法与文案 |
-| `oar-engine.mjs` | OAR 适配器：真起 pi 子进程、把文本映射成 DSH 流式帧 |
+| `oar-engine.mjs` | OAR 适配器：真起 pi 子进程、把文本映射成 DSH 流式帧（模型/思考等级由选区解析后透传） |
+| `pi-models.mjs` | **模型面**：Pi 模型目录（OAR/`models.json`）→ DSH `ctx.llm` provider；DSH 选区 → pi 选择子 |
 | `pi-session.mjs` | **pi 会话/Agent 生命周期宿主**：建会话（落盘）→ 注册 Agent → 首轮 durable turn（见下节） |
 | `client.js` | 桌面端「⚡ 引擎」Chip 的客户端半边 |
 
@@ -154,6 +155,66 @@ forceEngine > 请求 marker > 会话已绑定引擎 > agentPreset 兼容命中 >
 不是「这一条会话换引擎」；后者做不到的原因同上（建 Agent 时才能定引擎，且
 `SessionCreateRequest` 没有给第三方留扩展位）。
 
+## 模型面（L8：模型选择器跟着引擎走）
+
+引擎决定「底座谁在驱动」，模型决定「底座用哪个模型出话」——两者都要落到真处。L8 之前模型面是断的：
+`oar-engine.mjs` 里 provider/model **写死**成 `magpie/auto/deepseek-v4.1-flash`，UI 里选什么都没用；
+DSH 的模型目录又只读宿主 `ctx.llm` 的注册表，插件没往里注册过任何东西，于是「切到 Pi 之后模型列表看不出 Pi」。
+
+现在这两件事由 `pi-models.mjs` 一处收敛：
+
+```
+engine = native              engine = pi
+┌───────────────────┐        ┌───────────────────────┐
+│ 原生模型组         │        │ Pi 模型组（来自 OAR）  │
+│（宿主 llm 自己的） │        │ + 宿主自己的模型组      │
+│  ✗ 没有 pi 组      │        │                       │
+└───────────────────┘        └───────────────────────┘
+        ▲                              ▲
+        └── 注销 pi provider            └── 注册 pi provider
+            （负向防误杀）                    （目录 ⟷ 执行同源）
+```
+
+三条事实依据（不是口味，改动前先读它们）：
+
+1. **目录与执行同源**。Pi 的 `SessionOptions.model` 由 pi 自己的 ModelRuntime 解析
+   （`oar/dist/runtimes/pi/resolve.js` 的 `piResolveModel`）：未知模型直接抛
+   `RuntimeFailureError(model_unavailable)`、**不回落**。所以目录首选 OAR 的
+   `runtime.listModels(installation, {cwd})` —— 与 `pi --list-models`、与真实会话同一条
+   `createAgentSessionServices` 路径（含扩展注册的 provider 与认证可用性过滤）；
+   OAR 列不出来时才退到 `~/.pi/agent/models.json`，并把来源如实标成 `models.json`。
+2. **provider id 用 `pi`，model id 直接用 pi 的全限定选择子**（如 `magpie/auto/deepseek-v4.1-flash`）。
+   原因有二：真机宿主已经注册了 `magpie` / `magpie-responses` / `magpie-anthropic`
+   （`~/.dsh/settings.yaml` 的 `llm-pi-ai`），复用原生 provider 名会 `DUPLICATE_ADAPTER` 直接抛；
+   而把 model id 定义成 pi 的全限定 id 之后，选区 `(pi, magpie/auto/…)` 与原生选区
+   `(magpie, auto/…)` 落到**同一个** pi 选择子，中间不需要任何翻译函数。
+3. **注册/注销跟着引擎选择器走**，且只在 `engine === 'pi'` 时注册。注册/注销都经
+   `ctx.llm.registerAdapter`，它提交时会 emit `llm/adapters-updated`，浏览器半边
+   （`@deepseek-ai/dsh-client-ui-model-selection`）订阅该事件刷新目录 ⇒
+   「切到 Pi，模型下拉框跟着出现 Pi 组」**不需要任何自定客户端逻辑**。
+
+**执行透传**：引擎每次 attempt 都**现读会话当前选区**（`agent.model.current()` 写的那一份，
+由 `pi-session.mjs` 暴露为 `selectionFor`），交给 `pi-models.mjs` 的 `resolvePiAttempt` 解析：
+
+```
+选区命中 pi 目录          → 逐字用（source: selection），思考等级只在该模型真的提供时才透传
+选区不在 pi 目录里        → 回落 config 的钉死值（source: fallback + 原因）
+没有选区                  → pending 钉死值（source: default）
+目录拿不到（OAR 不可用）   → 钉死值（source: config，= L8 之前的既有行为）
+```
+
+思考等级（pi 的 thinking level）**只有 `source: selection` 那条路才带**：等级是选区的一部分，
+选区没被采纳时它也不该跟着走。模型不提供该档位时**丢掉档位并如实记 `effortOmitted`**，
+而不是把模型不认的档位硬塞给 pi（OAR 的 `piEffortRefusal` 会让这次开会话直接失败）。
+
+所有回落都写进证据 JSON 的 `modelAttempt`：
+`{kind, selection, requested, piModel, modelSource, modelFallbackReason, effort, effortOmitted, effectiveModel, provider, mismatch, error}`——
+「用户选了什么 / 换算成什么 / 实际生效什么 / 有没有回落」四件事都能单独审计，
+durable 会话日志里的 `assistant/message.source` 也从**有效模型**拆（历史不会说谎）。
+
+**配置面**：`pi.provider` / `pi.model` 从「唯一权威」降级为**回落用之钉死值**（缺省仍是
+`magpie` / `auto/deepseek-v4.1-flash`），语义见上表。
+
 ## 回滚机制
 
 ### 方式 1：安全模式（推荐）
@@ -178,7 +239,7 @@ bash rollback.sh
 
 ## 开发与测试
 
-本项目包含六个可复跑的测试套件（全部不调模型，除 `endo-pi.sh`）：
+本项目包含九个可复跑的测试套件（全部不调模型，除 `endo-pi.sh` 与 `endo-session.sh`）：
 
 ### 1. client-ui.sh（「⚡ 引擎」客户端 bundle，83 条）
 
@@ -204,7 +265,7 @@ bash client-ui.sh
 bash engine-selector.sh
 ```
 
-期望输出：`SUMMARY: 81 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+期望输出：`SUMMARY: 82 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
 
 ### 3. smoke.sh（冒烟测试，27 条）
 
@@ -269,7 +330,7 @@ bash session-lifecycle.sh
 `NEG_NATIVE`（engine=native 严格直通、零 pi 污染）、`RESUME`（新进程冷开旧会话并接着聊）、
 `UNLOAD`（卸载不留无主条目）。
 
-### 8. endo-session.sh（真机 Web Host 新建会话 + 首轮 + 重启续聊，18 条）
+### 8. endo-session.sh（真机 Web Host 新建会话 + 首轮 + 重启续聊 + 模型面真机正负向，28 条）
 
 在**隔离 DSH_HOME** 下起一个真实 `dsh web` 宿主（与桌面端同一套 session controller），
 用与桌面端逐字相同的 RPC 信封打 `session/create` → `session/state` → `session/prompt`，
@@ -279,10 +340,44 @@ bash session-lifecycle.sh
 bash endo-session.sh
 ```
 
-期望输出：`SUMMARY: 18 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+期望输出：`SUMMARY: 28 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+
+L8 新增的 10 条断言（真机面）：`MODEL_CATALOG_PI_GROUP`（真机 `session/modelCatalog` 里有 Pi 组，
+本机 111 个模型）、`MODEL_CATALOG_PI_IDS`（模型 id 是 pi 全限定选择子）、`MODEL_SELECT_ACCEPTED`
+（`session/selectModel` 双闸都过）、`MODEL_CATALOG_SOURCE`（目录来自 OAR）、`MODEL_SYNC_REGISTERED`、
+`MODEL_SELECTION_PASSTHROUGH`（**选一个与 config 钉死值不同的模型**，证明是真透传不是回落）、
+`MODEL_SOURCE_DURABLE`（durable 日志里的 assistant source = 所选模型），以及负向三条
+`NEG_NATIVE_CATALOG_CLEAN` / `NEG_NATIVE_PROVIDER_ABSENT` / `NEG_NATIVE_NO_PI_PROCESS`
+（以 `engine: native` 第二次注入启动：目录无 pi 组、`registered=false`、宿主日志零 pi 会话）。
+
+> 为什么负向要**再起一次宿主**：本 harness 用 `--patch`（命令行 overlay）注入插件，
+> host 会拒绝对该 entry 的 settings 写入
+> （`settings/rejected: Configuration for "…" is overridden by a home patch or command-line overlay`），
+> 所以「真机上把引擎切回 native」只能靠一次以 `engine: native` 注入的启动来复现。
+> 「同一进程内切引擎 → 目录消失 → 再切回来」的**可逆性**由确定性套件 `pi-models-sync.sh` 覆盖。
 
 **⚠️ 注意**：会调用**真实模型**（≤2 次）、需要 `.pi-agent/` 凭据与 `.recon/dsh-src` 抽取树；
 真实 `~/.dsh` 全程只读指纹（断言 `REAL_HOMEDIR_UNTOUCHED`）。
+
+### 9. pi-models-sync.sh（Pi 引擎 ⇄ DSH 模型选择器联动，82 条）
+
+不调模型、不联网的确定性套件：真实 cordis Context + **真实 `@deepseek-ai/dsh-llm` 的 LlmRuntime**
+（宿主目录读的就是它）+ 真实 AgentRegistry + 真实 SessionStore + 真实加载 `index.js`。
+替身只有两处且明确标注：`@botiverse/oar` 模块替身（不 spawn、不打模型）、原生 target 替身。
+
+```bash
+bash pi-models-sync.sh
+```
+
+期望输出：`SUMMARY: 81 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+
+断言分组：`PI_SOURCE`（目录来源：OAR 优先 / `models.json` 兜底 / disabled 剔除 / id 不改写 / TTL + invalidate）、
+`PI_ADAPTER`（DTO 投影过宿主的 `INVALID_CATALOG` / `UNKNOWN_MODEL` / `UNSUPPORTED_REASONING_EFFORT` /
+`PI_CATALOG_ONLY` 明确拒绝）、`PI_CATALOG`（engine=pi 时目录出现在宿主投影里）、
+`PI_SELECTION`（`selectModel` 的两道闸）、`PI_EXEC`（**透传**：含中途换模型、档位不透传、
+    选区原文与实际生效值的证据、durable source）、`PI_LATE`（llm 后到 / 缺席都不拖累接管）、
+`NEG_NATIVE`（注销 + 零列目录 + 原生直通 + 零替身污染）、`PI_ENGINE_DIRECT`（没接模型面的
+独立 oar-engine 保持既有行为）、`UNLOAD`（provider 归还宿主）。
 
 ### 另外三条零成本回归
 
@@ -315,7 +410,10 @@ bash rehearse-rollback.sh                  # 回滚彩排（20 条，含 DESKTOP
 1. **仅验证过 Pi 引擎**：其他引擎（如 DeepSeek / Claude）未实现
 2. **工具桥接未实现**：DSH 的工具调用（tool calls）尚未通过 OAR 传递给引擎
 3. **Steer / Abort 未实现**：用户中断（abort）和引导（steer）操作未处理
-4. **模型必须显式钉死**：在 `real-pi-patch.yml` 中必须指定 `model` 字段（如 `pi-mini-prod`），否则 OAR 会根据自身逻辑自动选择模型，可能与预期不符
+4. **模型不再是「必须显式钉死」，而是「默认钉死 + 选区优先」**：`pi.provider` / `pi.model`
+   现在是**回落用**的钉死值（缺省 `magpie` / `auto/deepseek-v4.1-flash`）。
+   正常情况下用会话里选中的模型（UI / `selectModel` / `agentOptions`）；选区不在 pi 能跑的目录里时
+   才回落到这个钉死值，并在证据里如实记 `modelSource: fallback` + 原因。
 5. **引擎选择器是「新任务默认」而不是「当前任务开关」**：引擎只在建 Agent 时能定，见上文的语义边界一节
 6. **会话→引擎绑定只在进程内**：桌面端重启后，存量会话重新按选择器（或会话 header 里的 `agentPreset`）决定引擎
 7. **pi 只吃本轮用户文本**：L7 之后 pi 会话的历史存在 DSH 会话里、重启也能冷开接着聊，但送给 pi 的 prompt 仍然**只有本轮用户文本**（不把 DSH 历史喂给 pi）；跨引擎续跑同一会话时，pi 侧不掌握前文
@@ -326,7 +424,20 @@ bash rehearse-rollback.sh                  # 回滚彩排（20 条，含 DESKTOP
     没有日志，冷开时插件会**明确报错**（`pi engine: 无法重新载入会话 "…"`）而不是伪造一个空会话
 11. **`steer` 语义仍是「当新一轮」**：pi 引擎一轮 attempt 跑起来就无法中途插话，
     `steer` 会当成新一轮 turn；`cancel` 只保证「未提交的 attempt 不再写入会话」
-12. **`endo-pi.sh` 有一条天然会抖的断言**：它要求真模型逐字复述 20 字符随机 token，
+12. **Pi 模型目录是 host 全局的、一次只列一个 cwd**：OAR 按 cwd 列模型（某个工作区的
+    `.pi/extensions` 可以注册 provider），而 DSH 的模型目录是 host 级的 —— 本插件只能用
+    `config.pi.cwd`（缺省进程 cwd）列一次。工作区专属的 pi provider 不在目录里；
+    选这类模型会走 `modelSource: fallback` 回落（如实记），不会被静默替换。
+13. **OAR 的模型条目不带 contextWindow / inputModalities**：走 OAR 路径时 DSH 侧这两个字段是缺的
+    （不猜、不编）；只有 `models.json` 兜底路径有 `contextWindow` 才带上。
+14. **`pi` provider 只做目录，不做真实调用**：若有人让原生 AgentLoop 拿 `pi` 组的模型去发请求，
+    会拿到明确的 `PI_CATALOG_ONLY` 错误（而不是静默出一个假模型的答案）。pi 出话走 OAR 子进程。
+15. **目录有 30s TTL 缓存**：OAR 说这份列表是 usable-now（理应每次现查），但 DSH 的目录刷新
+    由多个事件触发；本插件采取「TTL 内复用 + 引擎切换时强制失效」，即一次引擎激活 = 一次真实列表。
+16. **`pi` 组也会出现在「设置 → 模型」页**：那份页面把 `llm.listProviders()` 的**每个** provider
+    都列出来（官方行为），而 `pi` 不是「可配置 provider」（没有 apiKey/baseURL 那一套），
+    所以它在那页是一行**只读**条目（`settingsNs: ''`、显示未配置）。目录与执行不受影响。
+17. **`endo-pi.sh` 有一条天然会抖的断言**：它要求真模型逐字复述 20 字符随机 token，
     模型偶发少输出末尾一个字符就会 FAIL（本轮四次运行中失败一次，重跑即绿）。
     失败时证据 JSON 里的 `piTextLength` / `piTextDeltas` 可用于区分「模型少说」还是「适配器丢分片」
 

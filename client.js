@@ -124,7 +124,7 @@ window.__ModuleLoader__.load({
 			engineNative: "原生引擎",
 			engineNativeHint: "DSH 自带的 AgentLoop：工具卡、流式输出、中断都完整",
 			enginePi: "Pi 引擎",
-			enginePiHint: "OAR 驱动的 Pi 子进程：只拿本次输入（不带 DSH 历史、不出工具卡）",
+			enginePiHint: "OAR 驱动的 Pi 子进程；模型列表跟着 Pi 走（模型选择器里出现「Pi」模型组）",
 			engineEcho: "回声引擎",
 			engineEchoHint: "只回显固定文本、不起模型，联调专用",
 		};
@@ -148,7 +148,7 @@ window.__ModuleLoader__.load({
 			engineNative: "Native engine",
 			engineNativeHint: "DSH's own AgentLoop: tool cards, streaming and aborts all work",
 			enginePi: "Pi engine",
-			enginePiHint: "A Pi subprocess driven by OAR: receives this input only (no DSH history, no tool cards)",
+			enginePiHint: "A Pi subprocess driven by OAR; the model list follows Pi (a «Pi» model group appears in the model picker)",
 			engineEcho: "Echo engine",
 			engineEchoHint: "Echoes fixed text without calling a model — for wiring checks",
 		};

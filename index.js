@@ -101,6 +101,16 @@ import {
   sessionIdOfOptions,
   textOfUserMessage,
 } from './pi-session.mjs'
+import {
+  createPiCatalogBinding,
+  createPiCatalogSource,
+  PI_DEFAULT_MODEL,
+  PI_DEFAULT_PROVIDER,
+  PI_PROVIDER_ID,
+  PI_PROVIDER_NAME,
+  resolvePiAttempt,
+  splitPiModelId,
+} from './pi-models.mjs'
 
 /** agentPreset 兼容命中后路由到 pi 引擎的默认 preset 名（config.piPreset 的默认值）。 */
 export const DEFAULT_PI_PRESET = 'pi'
@@ -176,6 +186,21 @@ export { createOarEngine, isPiMarked, PI_ENGINE_ID, PI_PROMPT, PI_OK_MARKER }
  * 供测试直接用同一模块实例做单元断言（不再造第二套替身）。
  */
 export { createPiSessionHost, createStandInSubject }
+
+/**
+ * 再导出「Pi 模型面」的公开面（pi-models.mjs）：目录注册/注销、选区→pi 选择子的解析
+ * 都在那里定义，这里只是把同一实例交给测试与宿主（供 `===` 身份校验与单元断言）。
+ */
+export {
+  createPiCatalogBinding,
+  createPiCatalogSource,
+  resolvePiAttempt,
+  splitPiModelId,
+  PI_DEFAULT_MODEL,
+  PI_DEFAULT_PROVIDER,
+  PI_PROVIDER_ID,
+  PI_PROVIDER_NAME,
+}
 
 /** 插件名（日志/效果名可读性）。 */
 export const PLUGIN_NAME = '@local/dsh-engine-switch'
@@ -686,6 +711,21 @@ export function createEvidenceStore(config = {}) {
     piSessionLastEvent: null,
     /** 生命周期事件顺序表（最多保留 40 条，防止证据无限膨胀）。 */
     piSessionEvents: [],
+    // —— Pi 模型面（L8：引擎与模型选择器的联动）——
+    /** 最近一次模型目录同步的结果（providerId / engine / registered / 目录来源与条数）。 */
+    modelSync: null,
+    /** 目录参与过的注册/注销事件计数（切一次引擎各算一次）。 */
+    modelSyncCounters: { register: 0, withdraw: 0, attach: 0, error: 0 },
+    /** 最近一次模型面事件（事件名 + 细节）。 */
+    modelSyncLastEvent: null,
+    /** 目录当前用的是哪一份列表（'oar' | 'models.json' | 'none'）。 */
+    modelCatalogSource: null,
+    /** 目录里有多少条候选模型。 */
+    modelCatalogModels: 0,
+    /** 目录列不出来时的原因（OAR 不可用 / 读盘失败 …）。 */
+    modelCatalogError: null,
+    /** 模型面自己的失败原因（注册被拒 / 注销失败）；空串/缺失 = 无错。 */
+    modelSyncError: null,
     takeoverPhase: 'not-installed',
     failReason: null,
     writes: 0,
@@ -840,6 +880,34 @@ export function createEvidenceStore(config = {}) {
       return evidence
     },
     /**
+     * 记一次 attempt 的**模型面**结论（L8）：选区、解析出的 pi 选择子、思考等级、
+     * 生效模型，以及回落原因。**每个 kind 都记**（含 createAgent）——
+     * `piText` 那组字段仍然是 resume 专有（改它会动到既有真机断言的语义）。
+     *
+     * @param {'createAgent'|'resume'} kind 调用种类
+     * @param {object|null} result oar-engine 的 attempt 记录
+     * @returns {object} 证据对象
+     */
+    recordModelAttempt(kind, result) {
+      if (result === null || typeof result !== 'object') return evidence
+      evidence.modelAttempt = {
+        kind,
+        selection: result.selection ?? null,
+        requested: result.modelRequested ?? null,
+        piModel: result.piModel ?? null,
+        modelSource: result.modelSource ?? null,
+        modelFallbackReason: result.modelFallbackReason ?? null,
+        effort: result.modelEffort ?? null,
+        effortOmitted: result.modelEffortOmitted ?? null,
+        effectiveModel: result.effectiveModel ?? null,
+        provider: result.provider ?? null,
+        mismatch: result.modelMismatch ?? null,
+        error: typeof result.error === 'string' && result.error !== '' ? result.error : null,
+      }
+      write('pi-models')
+      return evidence
+    },
+    /**
      * 记一条 pi 会话/Agent 生命周期事件（pi-session.mjs 的 onEvent 回调）。
      * 只写事实：建会话 / 落盘 / 注册 Agent / turn 提交 / 失败原因，不写用户原文。
      * @param {string} event 事件名（如 'pi-session/attached'）
@@ -861,6 +929,43 @@ export function createEvidenceStore(config = {}) {
      */
     recordPiSessionSnapshot(snapshot) {
       if (snapshot !== null && typeof snapshot === 'object') evidence.piSession = snapshot
+      return evidence
+    },
+    /**
+     * 记一条 Pi 模型面事件（pi-models.mjs 的 binding onEvent 回调）。
+     *
+     * 只写事实：注册/注销/接管失败 + 目录当前来源与条数。模型面是**旁路能力**
+     * （目录列不出来不该影响接管），所以它的失败只记不抛。
+     *
+     * @param {string} event 事件名（'pi-models/registered' | 'pi-models/withdrawn' | 'pi-models/error' …）
+     * @param {object} [detail] 事件细节
+     * @returns {object} 证据对象
+     */
+    recordModelSync(event, detail = {}) {
+      evidence.modelSyncLastEvent = { event, detail }
+      if (event === 'pi-models/registered') evidence.modelSyncCounters.register += 1
+      else if (event === 'pi-models/withdrawn') evidence.modelSyncCounters.withdraw += 1
+      else if (event === 'pi-models/attached') evidence.modelSyncCounters.attach += 1
+      else if (event === 'pi-models/error') {
+        evidence.modelSyncCounters.error += 1
+        evidence.modelSyncError = detail.error ?? null
+      }
+      write('pi-models')
+      return evidence
+    },
+    /**
+     * 记 Pi 模型面的当前快照（pi-models.mjs 的 binding.snapshot()）。
+     * @param {object} snapshot 绑定快照
+     * @returns {object} 证据对象
+     */
+    recordModelSyncSnapshot(snapshot) {
+      if (snapshot === null || typeof snapshot !== 'object') return evidence
+      evidence.modelSync = snapshot
+      evidence.modelCatalogSource = snapshot.catalogSource ?? null
+      evidence.modelCatalogModels = snapshot.models ?? 0
+      evidence.modelCatalogError = snapshot.catalogError ?? null
+      evidence.modelSyncError = snapshot.lastError ?? evidence.modelSyncError
+      write('pi-models')
       return evidence
     },
   }
@@ -1079,6 +1184,62 @@ export function apply(ctx, config = {}) {
   /** agentPreset 兼容配置：options.meta.agentPreset 命中该名时一律交给 pi 引擎；缺省 'pi'。 */
   const piPreset = normalizePiPreset(config.piPreset)
   const store = createEvidenceStore(config)
+  /** 最近一次因引擎改变而同步的取值（只在变化时落盘，见 syncPiModelCatalog）。 */
+  let lastSyncedEngine = Symbol('unset')
+
+  /**
+   * Pi 模型面（L8）。两个零件分开是有原因的：
+   *   · `source` 知道「怎么把 Pi 真实能跑的模型列出来」（OAR runtime 为主 / models.json 兜底，带 TTL 缓存）；
+   *   · `binding` 知道「什么时候把它注册进 ctx.llm」（engine=pi 注册、其余注销）。
+   * 两者都不依赖 ctx.agents，所以在 apply 阶段就能装好 —— 目录与引擎选择器同步地跟随。
+   * cwd 用 config.pi.cwd（拿不到就进程 cwd）：OAR 按 cwd 列模型（项目扩展可注册 provider），
+   * 而目录是 host 全局的（不是会话级），所以只能选一个 cwd —— 这一点写在 README 的诚实边界里。
+   */
+  const piModelSource = createPiCatalogSource({
+    agentDir: piConfig.agentDir,
+    cwd: piConfig.cwd,
+    timeoutMs: Number.isFinite(piConfig.timeoutMs) ? piConfig.timeoutMs : undefined,
+    // 真列完一次就把「目录长什么样」写进证据（含来源与失败原因）。用一层 holder 是为了让
+    // 回调能同时读到 binding 的**当前**快照而不制造循环引用（回调都在构造完成之后才触发）。
+    onLoad: (loaded) => piModelCatalogEvents.onLoad?.(loaded),
+  })
+  const piModelBinding = createPiCatalogBinding({
+    source: piModelSource,
+    providerId: PI_PROVIDER_ID,
+    providerName: PI_PROVIDER_NAME,
+    onEvent: (event, detail) => {
+      // 先落快照再落事件：`recordModelSyncSnapshot` 会把当前状态写进文件，
+      // 反过来（先写事件）会让文件里留下**上一次**的快照，证据自相矛盾。
+      store.recordModelSyncSnapshot(piModelBinding.snapshot())
+      store.recordModelSync(event, detail)
+    },
+  })
+  /** 目录加载回调的接线点（见上面 onLoad 的说明）。 */
+  const piModelCatalogEvents = {
+    onLoad: (loaded) => {
+      // 顺序同上：快照先落，事件后落（证据里看到的是「列完之后」的状态）。
+      store.recordModelSyncSnapshot(piModelBinding.snapshot())
+      store.recordModelSync('pi-models/catalog', loaded)
+    },
+  }
+
+  /**
+   * 把「目录与引擎保持一致」+「快照落证据」收成一个动作（多处触发点共用）。
+   *
+   * @param {string|null} engine 当前引擎取值（归一化后）
+   * @returns {object} 目录绑定快照
+   */
+  const syncPiModelCatalog = (engine) => {
+    const snapshot = piModelBinding.sync(engine)
+    // 只在「引擎取值真的换了」时落快照 + 写盘：create/resume 热路径每回都会调到这里，
+    // 每次都写盘会把证据写变成热路径开销。
+    if (lastSyncedEngine !== engine) {
+      lastSyncedEngine = engine
+      store.recordModelSyncSnapshot(snapshot)
+      store.write('pi-models')
+    }
+    return snapshot
+  }
 
   /**
    * 选择器的**现读**唯一定义处。
@@ -1088,7 +1249,12 @@ export function apply(ctx, config = {}) {
    */
   const readEngineSelectorNow = () => {
     const raw = readVolatile(config.engine)
-    return { normalized: normalizeEngineId(raw), raw }
+    const normalized = normalizeEngineId(raw)
+    // 模型目录跟着引擎走（幂等：取值没变时零动作）。放在这里而不是只放在事件里，
+    // 是因为 create/resume 每次都会现读一次选择器 —— 用户在设置页/命令/UI 改了引擎，
+    // 下一次建会话前目录必定已经就位（不依赖事件是否送达）。
+    syncPiModelCatalog(normalized)
+    return { normalized, raw }
   }
 
   /**
@@ -1108,6 +1274,24 @@ export function apply(ctx, config = {}) {
   store.recordEntryId(entry.entryId, entry.source)
   /** apply 时先现读一次选择器：证据里就能看到「本进程开始时选择器是什么」。 */
   readEngineSelector('apply')
+
+  // 模型目录的另外两个触发点（幂等，重复触发零代价）：
+  //   ① settings 文档变了（设置页 / `/engine` 命令 / 桌面端 Chip 写的都是它）；
+  //   ② llm 服务后到（真实组装里 llm 与 agents 提供的先后顺序不定）。
+  // 刻意**不用** `ctx.inject(['llm'], …)`：那会给插件多挂一条「等 llm」的 fiber，
+  // 在极简组装（单测 / 只装 agents 的宿主）里会挂住不结算；下面的写法在任何组装里都安全。
+  if (typeof ctx?.on === 'function') {
+    ctx.on('settings/document-updated', () => {
+      syncPiModelCatalog(readEngineSelectorNow().normalized)
+    })
+    ctx.on('internal/service', (name) => {
+      if (name !== 'llm') return
+      const llmService = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+      if (piModelBinding.attach(llmService)) syncPiModelCatalog(readEngineSelectorNow().normalized)
+    })
+  }
+  piModelBinding.attach(typeof ctx?.get === 'function' ? ctx.get('llm') : undefined)
+  syncPiModelCatalog(readEngineSelectorNow().normalized)
   /** 会话 → 引擎 绑定表（进程内）：同一会话只认一个底座。 */
   const bindings = createEngineBindings()
   const registerCommand = registerEngineCommand(ctx, config, store, bindings, entry.entryId, readEngineSelector)
@@ -1150,8 +1334,10 @@ export function apply(ctx, config = {}) {
       // 事件回调只写旁路证据，不影响主流程；每条事件顺便刷新一次宿主快照
       // （真机断言读的就是 piSession.sessions[].durable / published）。
       onEvent: (event, detail) => {
-        store.recordPiSession(event, detail)
+        // 先落快照再落事件：`recordPiSession` 会写盘，反过来写会让文件里留下
+        // **上一个事件时刻**的会话快照（例如 `model.select()` 之后的选区读不到）。
         store.recordPiSessionSnapshot(piSessionHost.snapshot())
+        store.recordPiSession(event, detail)
       },
     })
     // 真引擎：pi 引擎只在被 marker 命中时才 spawn 子进程（懒启动，见 pi-engine.mjs）。
@@ -1166,6 +1352,33 @@ export function apply(ctx, config = {}) {
       cwd: piConfig.cwd,
       piModulePath: piConfig.piModulePath,
       sessionHost: piSessionHost,
+      /**
+       * 模型面接线（L8）：选区 → 本次 attempt 真正交给 pi 的选择子。
+       *
+       * 选区从**会话宿主现读**（用户在 UI 里换过模型就是新值），在 pi 目录里命中就逐字用；
+       * 没命中就回落 config 的显式钉死值（`pi.provider` / `pi.model`，缺省
+       * magpie / auto/deepseek-v4.1-flash），并把回落原因写进 attempt 记录与证据。
+       * 目录拿不到（OAR 不可用）时同样是 config 钉死值 —— 也就是 L8 之前的既有行为。
+       */
+      resolveAttemptModel: async (selection) => {
+        // 目录还没列过就列一次：让「选区的真伪」有目录可比，而不是因为「用户没点开模型下拉框」
+        // 就默默回落到 config 钉死值（那会让本轮的透传承诺依赖 UI 的副效应）。
+        if (piModelSource.peek() === null) {
+          try {
+            await piModelSource.load()
+          } catch {
+            // 拿不到目录不是错误：resolvePiAttempt 会如实回落到 config 钉死值。
+          }
+        }
+        return resolvePiAttempt({
+          selection,
+          catalog: piModelSource.peek(),
+          defaultModel: {
+            provider: piConfig.provider ?? PI_DEFAULT_PROVIDER,
+            model: piConfig.model ?? PI_DEFAULT_MODEL,
+          },
+        })
+      },
     })
     const router = createRouter(nativeTarget, echoEngine, piEngine, {
       forceEngine,
@@ -1181,6 +1394,8 @@ export function apply(ctx, config = {}) {
       onPiResult: async (kind, result, error, engineCtx, options) => {
         const sessionId = sessionIdOfOptions(options)
         const subject = result?.subject ?? null
+        // 模型面结论**每个 kind 都记**（create 那一轮也算一次真实 pi 调用）。
+        store.recordModelAttempt(kind, result)
         // createAgent 之外的阶段（resume / followup 里的 attempt）：结果照旧记证据
         // （piText / piEngineError / runtimeId … 字段名与语义与改造前一致）。
         if (kind !== 'createAgent') store.recordPiResult(kind, result, error)
@@ -1199,6 +1414,9 @@ export function apply(ctx, config = {}) {
               'resume',
             )
             store.recordPiResult('resume', piResult, null)
+            // turn 走的是**直接调引擎**（不经过 router 的 onPiResult），所以模型面结论
+            // 要在这里补记一次 —— 否则证据里的 modelAttempt 会永远停在建会话那一轮。
+            store.recordModelAttempt('resume', piResult)
             const text =
               typeof piResult.piText === 'string'
                 ? piResult.piText
@@ -1210,20 +1428,24 @@ export function apply(ctx, config = {}) {
             store.evidence.assistantMessageAppended = true
             store.evidence.committedText = text
             store.evidence.commitError = null
-            // provider/model 如实交给宿主写进 assistant/message.source（pi 钉死的路由值）
+            // provider/model 如实交给宿主写进 assistant/message.source。
+            //
+            // L8 起有效模型不再总是 config 里钉死的那一个（可能是 UI 选的任何 pi 模型，
+            // provider 也可能不同），所以**从有效模型本身**拆：
+            // `magpie/auto/deepseek-v4.1-flash` → provider `magpie` + model `auto/deepseek-v4.1-flash`。
+            // 拿 piResult.provider（config 值）当判定基准会在「选区换了 provider」时写错 source。
             const effectiveModel =
               typeof piResult.effectiveModel === 'string' ? piResult.effectiveModel : ''
-            const slash = effectiveModel.indexOf('/')
+            const effectiveSplit = splitPiModelId(effectiveModel)
             return {
               text,
               piResult,
-              provider: typeof piResult.provider === 'string' ? piResult.provider : 'pi',
-              model:
-                slash > 0 && effectiveModel.slice(0, slash) === piResult.provider
-                  ? effectiveModel.slice(slash + 1)
-                  : effectiveModel === ''
-                    ? 'pi'
-                    : effectiveModel,
+              provider: effectiveSplit === null
+                ? (typeof piResult.provider === 'string' ? piResult.provider : 'pi')
+                : effectiveSplit.providerId,
+              model: effectiveSplit === null
+                ? (effectiveModel === '' ? 'pi' : effectiveModel)
+                : effectiveSplit.modelId,
             }
           })
           // 发布失败时必须**看着失败**：交回一个没注进注册表的 Agent，
@@ -1303,6 +1525,11 @@ export function apply(ctx, config = {}) {
         }
         // 卸载 pi 会话宿主：把注册过的 Agent / 会话从各自 store 里摘掉（磁盘日志保留）。
         installed.piSessionHost?.dispose?.().catch(() => {})
+        // 卸载 Pi 模型面（L8）：把 `pi` provider 从宿主 llm 注册表里注销（不留「插件没了、
+        // provider 还在」的残骸）；先落一次快照再注销，证据里能看到卸载前的状态。
+        store.recordModelSyncSnapshot(piModelBinding.snapshot())
+        piModelBinding.dispose()
+        store.write('unload')
         state.installed = null
       },
       `${PLUGIN_NAME}:restore`,

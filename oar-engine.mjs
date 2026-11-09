@@ -13,10 +13,14 @@
  *   - `promptAndWait(session, text)` 发提示拿文本
  *   - `session.dispose()` 清理
  *
- * 显式钉死 provider/model：
- *   - 从 config 传入（`config.provider` / `config.model`）
- *   - 默认 magpie / auto/deepseek-v4.1-flash
- *   - 通过 OAR session options 的 `model` 字段传入（需验证 OAR 的 session API）
+ * 显式钉死 provider/model（L8 起改为「会话现读选区优先」）：
+ *   - 会话当前选区（`agentOptions` / UI `selectModel` 写进的 `agent.model`）
+ *     → 交给 `config.resolveAttemptModel` 解析成 pi 全限定选择子（也回一份 `effort`）；
+ *   - 解析不到/没有选区 → 回落 config 的 `provider` / `model`（默认 magpie / auto/deepseek-v4.1-flash）
+ *   - 回落的**原因**如实写进记录（`modelSource` / `modelFallbackReason`），不假装用了选区。
+ *
+ * 读回实际 model（`session.model()`）并与请求值一并落记录：OAR 自己也做这道校验
+ * （`oar/dist/runtimes/pi/open.js`：读回不等于请求就抛），本模块再留一份证据。
  *
  * 事实依据：
  *   - OAR 已装：@botiverse/oar@0.95.0
@@ -32,6 +36,13 @@
 
 import { defaultRuntimes, piSession, promptAndWait } from '@botiverse/oar'
 import { agentEvents, emitAgentEvent } from '@deepseek-ai/dsh-agent'
+import {
+  piModelIdOfSelection,
+  pickModelSelection,
+  splitPiModelId,
+  PI_DEFAULT_MODEL,
+  PI_DEFAULT_PROVIDER,
+} from './pi-models.mjs'
 
 /** 引擎标识（与 pi-engine.mjs 保持一致）。 */
 export const PI_ENGINE_ID = 'pi'
@@ -47,9 +58,15 @@ export const OAR_STREAM_EVENT = 'agent/assistant-stream'
 /** pi 替身 subject 的默认 id（非真实 DSH Agent，仅作 scope carrier 的 key）。 */
 export const OAR_SUBJECT_ID = 'engine-switch:oar-pi'
 
-/** 默认 provider / model（显式钉死，防止 OAR 自行挑模型）。 */
-export const OAR_DEFAULT_PROVIDER = 'magpie'
-export const OAR_DEFAULT_MODEL = 'auto/deepseek-v4.1-flash'
+/**
+ * 默认 provider / model（回落用的钉死值，防止 OAR 自行挑模型）。
+ *
+ * 值的唯一定义处在 `pi-models.mjs`（模型面同时要用它做「选区不可用时的回落」）——
+ * 这里只做改名再导出，避免同一个默认值在仓库里出现两份会漂的副本。
+ * L8 之前这两个常量在本文件里各自字面量定义，值与现在逐字相同。
+ */
+export const OAR_DEFAULT_PROVIDER = PI_DEFAULT_PROVIDER
+export const OAR_DEFAULT_MODEL = PI_DEFAULT_MODEL
 
 /** 替身身份的 id 前缀：**只**在没有真实会话 id 时的回退（游离替身，不是会话身份）。 */
 export const OAR_STANDIN_PREFIX = OAR_SUBJECT_ID
@@ -247,6 +264,58 @@ export function createOarEngine(config = {}) {
     }
   }
 
+  /** config 里的钉死值（回落用；缺省与 L8 之前逐字同值）。 */
+  const configuredModel = {
+    provider: config.provider ?? OAR_DEFAULT_PROVIDER,
+    model: config.model ?? OAR_DEFAULT_MODEL,
+  }
+
+  /**
+   * 解析本次 attempt 的模型与思考等级。
+   *
+   * 两种来源，形状一致（都回 `{model, effort, source, reason, requested}`）：
+   *   · `config.resolveAttemptModel`（由 index.js 接线到 pi-models.mjs 的目录解析）：
+   *     实现「UI 选什么跑什么」；
+   *   · 没有接线（单测 / 独立使用 oar-engine）→ 用 config 的钉死值（既有行为）。
+   *
+   * 解析本身抛错「不该」发生（失败已在目录源里被吞成 `{model: 钉死值}`），但真抛了也不藏：
+   * 回落到钉死值并把原因写进记录。
+   *
+   * @param {unknown} options create/resume 参数
+   * @param {object|null} subject 已绑定的替身身份
+   * @param {object} o baseOptions 结果
+   * @returns {Promise<object>} 解析结果
+   */
+  async function resolveAttemptModel(options, subject, o) {
+    const sessionHost = config.sessionHost ?? null
+    // 选区来源：会话宿主现读（L8 的唯一权威）＞ 本次请求的 agentOptions。
+    const selection =
+      (typeof sessionHost?.selectionFor === 'function'
+        ? sessionHost.selectionFor(options, subject)
+        : null) ?? pickModelSelection(options?.agentOptions)
+    const fallback = {
+      model: `${configuredModel.provider}/${configuredModel.model}`,
+      effort: null,
+      source: 'config',
+      reason: 'no-model-plane',
+      requested: null,
+      selection,
+    }
+    // `requested` 一律是「选区在 pi 拼法下的样子」（与解析成功时的形状一致），
+    // `selection` 才是 DSH 原文 —— 两者分开，证据里才好区分「要什么」与「怎么拼」。
+    const requested = piModelIdOfSelection(selection)
+    if (typeof config.resolveAttemptModel !== 'function') return { ...fallback, requested }
+    try {
+      const resolved = await config.resolveAttemptModel(selection, { cwd: o.cwd, options, subject })
+      if (resolved === null || typeof resolved !== 'object' || typeof resolved.model !== 'string') {
+        return { ...fallback, requested }
+      }
+      return resolved
+    } catch (error) {
+      return { ...fallback, requested, reason: `resolve-failed: ${String(error?.message ?? error)}` }
+    }
+  }
+
   /**
    * 跑一次 OAR attempt。
    * @param {object} engineCtx 真实调用方上下文
@@ -277,6 +346,14 @@ export function createOarEngine(config = {}) {
       cwd: o.cwd,
       runtimeId: null,
       effectiveModel: null,
+      // L8 模型面：选区 → pi 选择子的解析结果（回落也照实记）。
+      selection: null,
+      piModel: null,
+      modelSource: null,
+      modelFallbackReason: null,
+      modelEffort: null,
+      modelEffortOmitted: null,
+      modelRequested: null,
       text: '',
       textDeltas: 0,
       frames: [],
@@ -305,6 +382,19 @@ export function createOarEngine(config = {}) {
       process.env.PI_CODING_AGENT_DIR = o.agentDir
     }
 
+    // 模型面（L8）：选区 → pi 全限定选择子 + 思考等级。读的是**会话当前选区**，
+    // 不是 install 时的快照（用户中途换模型，下一次输入就得用新模型）。
+    const resolvedModel = await resolveAttemptModel(options, subject, o)
+    record.selection = resolvedModel.selection ?? null
+    record.piModel = resolvedModel.model
+    record.modelSource = resolvedModel.source ?? null
+    record.modelFallbackReason = resolvedModel.reason ?? null
+    record.modelEffort = resolvedModel.effort ?? null
+    record.modelEffortOmitted = resolvedModel.effortOmitted ?? null
+    // 选区在 pi 拼法下的样子（`(pi, magpie/auto/x)` 与 `(magpie, auto/x)` 都归到 `magpie/auto/x`）：
+    // 与 `record.piModel`（最终采用的选择子）分开记，「选区要什么」与「实际用什么」才能分别断言。
+    record.modelRequested = resolvedModel.requested ?? null
+
     let session = null
     try {
       // 第 1 步：require('pi') 拿 runtime
@@ -328,18 +418,26 @@ export function createOarEngine(config = {}) {
         }
       }
 
-      // 第 3 步：piSession(installation, {cwd, model})
-      // 显式钉死 model：构造完整 model id（provider/model 形式）
-      const fullModelId = `${o.provider}/${o.model}`
+      // 第 3 步：piSession(installation, {cwd, model, effort?})
+      // model 是**解析出来的** pi 全限定选择子（`provider/modelId`，model id 自己可以带 `/`）；
+      // effort 是 pi 的 thinking level，只在该模型真的提供时才透传（见 pi-models.mjs 的说明）。
       session = await piSession(installation, {
         cwd: o.cwd,
-        model: fullModelId,
+        ...record.piModel === null || record.piModel === undefined ? {} : { model: record.piModel },
+        ...record.modelEffort === null || record.modelEffort === undefined ? {} : { effort: record.modelEffort },
       })
 
-      // 读回实际使用的 model id（验证钉死是否生效）
+      // 读回实际使用的 model id：OAR 已做了「不相等就抛」的硬校验，这里再留一份可断言的证据。
       const modelInfo = session.model()
       record.effectiveModel = modelInfo.value
       stats.effectiveModel = modelInfo.value
+      if (record.piModel !== null && record.piModel !== undefined && modelInfo.value !== record.piModel) {
+        record.modelMismatch = { requested: record.piModel, effective: modelInfo.value }
+      }
+      // `provider` 的语义是「谁真的服务了这次 attempt」：L8 起有效模型可能来自别的 pi provider
+      // （选区换了 provider），所以从有效模型现拆，不再用 config 里那个钉死值冒充。
+      const effectiveSplit = splitPiModelId(modelInfo.value)
+      if (effectiveSplit !== null) record.provider = effectiveSplit.providerId
 
       // 第 4 步：promptAndWait(session, text)
       const result = await promptAndWait(session, o.prompt)

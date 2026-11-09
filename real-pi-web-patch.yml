@@ -10,6 +10,11 @@
 #   · engine: 'pi'（**不是** forceEngine）—— 桌面端 ~/.dsh/profiles/desktop/cordis.patch.yml
 #     里配的就是这个字段，本脚本复现的是同一个判定入口（config.engine）。
 #   · pi.agentDir 指向工作区内已播种的 .pi-agent（pi 子进程缺它会因写锁文件 EPERM 直接崩）。
+#   · pi.provider / pi.model 是**回落用**的钉死值（L8 起语义）：正常情况下用会话里选中的模型
+#     （UI 的模型下拉框里就是 `pi` 组，见 README 的「模型面」一节）；仅当选区不在 pi 能跑的
+#     目录里（或 OAR 列不出来）时才回落到这一对值，并在证据里记 `modelSource` + 原因。
+#   · `engine: pi`（不是 forceEngine）：与桌面端 ~/.dsh/profiles/desktop/cordis.patch.yml 里
+#     配的是同一个字段，走的是同一个判定入口。
 - insert:
     - id: engine-switch-web-pi
       name: ./index.js

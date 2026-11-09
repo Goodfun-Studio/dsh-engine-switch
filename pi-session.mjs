@@ -43,6 +43,15 @@
 import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import { pickModelSelection } from './pi-models.mjs'
+
+/**
+ * 从一次 create/resume 的 `agentOptions` 里取模型选区快照（L8）。
+ *
+ * 唯一定义处是 `pi-models.mjs`（它同时定义「选区 → pi 选择子」的解析），本处只是再导出，
+ * 让「会话侧」的读法（引擎每次 attempt 现读会话当前选区）与「模型侧」的解析共享同一个快照规则。
+ */
+export { pickModelSelection }
 
 /** pi 替身 Agent 的 kind（与 oar-engine.mjs / pi-engine.mjs 的词汇一致）。 */
 export const PI_AGENT_KIND = 'pi-subject'
@@ -278,6 +287,10 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
         turns: 0,
         lastTurn: null,
         lastError: null,
+        // 会话当前选区（L8）：UI/agentOptions 给的模型选择。
+        // 放在条目上而不是闭包里，是因为引擎每次 attempt 都要**现读**它
+        // （用户在会话中途换了模型，下一次输入必须用新模型跑）。
+        selection: pickModelSelection(options?.agentOptions),
       })
       counters.attached += 1
       record('pi-session/attached', { sessionId, durable: false, reused: true })
@@ -361,6 +374,8 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
       turns: 0,
       lastTurn: null,
       lastError: null,
+      // 会话当前选区（L8）：见上面 reused 分支的同款说明。
+      selection: pickModelSelection(options?.agentOptions),
     }
     try {
       entry.sessionDetach = sessions.enter(session)
@@ -466,13 +481,13 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
   function installAgentSurface(entry, turnRunner) {
     const subject = entry.subject
     const options = entry.options
-    let selection = {
-      provider: options?.agentOptions?.provider,
-      model: options?.agentOptions?.model,
-      reasoningEffort: options?.agentOptions?.reasoningEffort,
-    }
+    // `options.agentOptions` 在真机上是带 getter 的活对象（每次现读 agentDefaultModel），
+    // 所以这里取一份**脱钩快照**；后续一切读写都发生在条目上。
+    let selection = pickModelSelection(options?.agentOptions) ?? {}
     const hasSelection = (value) =>
       typeof value?.provider === 'string' && typeof value?.model === 'string'
+    // 条目上的选区与闭包同步：`entry.selection` 是**引擎读的那一份**（L8 的透传入口）。
+    entry.selection = hasSelection(selection) ? { ...selection } : null
 
     subject.kind = PI_AGENT_KIND
     subject.engine = 'pi'
@@ -504,6 +519,8 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
           model: next.model,
           ...next.reasoningEffort === undefined ? {} : { reasoningEffort: next.reasoningEffort },
         }
+        // 现读源头：引擎每次 attempt 读的都是 entry.selection，不是这里的闭包。
+        entry.selection = { ...selection }
         if (changed) entry.session.append('model/selection', { ...selection })
       },
     }
@@ -655,6 +672,29 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
     subjectFor,
     attach,
     publish,
+    /**
+     * 读「这次 attempt 该按哪个选区走」（L8）。
+     *
+     * 优先级：会话条目上的现读选区（`agent.model.select()` 写过就是它）＞ 条目建会话时的
+     * `agentOptions` ＞ 本次请求的 `agentOptions`。读不到就是 null（引擎按自己的钉死值走）。
+     *
+     * 为什么必须现读而不是在 attach 时快照：桌面端换模型的路径是
+     * `session.selectModel` → `agent.model.select()`（只改条目上的选区），
+     * 若引擎拿的是 attach 时的旧值，用户换完模型的下一句话还会用旧模型跑。
+     *
+     * @param {unknown} options create/resume 参数
+     * @param {object|null|undefined} subject 替身身份（拿不到会话 id 时的兜底身份）
+     * @returns {{provider:string, model:string, reasoningEffort?:string}|null} 选区快照
+     */
+    selectionFor: (options, subject) => {
+      const sessionId = sessionIdOfOptions(options) ?? (typeof subject?.id === 'string' ? subject.id : null)
+      const entry = sessionId === null ? undefined : entries.get(sessionId)
+      return (
+        entry?.selection ??
+        pickModelSelection(entry?.options?.agentOptions) ??
+        pickModelSelection(options?.agentOptions)
+      )
+    },
     /** @param {string} sessionId @returns {object|undefined} 宿主条目（测试/证据用） */
     entryOf: (sessionId) => entries.get(sessionId),
     /** @param {string} sessionId @returns {object|undefined} 已绑定的 DSH Session */
@@ -679,6 +719,7 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
         lastError: entry.lastError,
         cwd: entry.session.header?.cwd ?? null,
         agentPreset: entry.session.header?.agentPreset ?? null,
+        selection: entry.selection ?? null,
       })),
     }),
     /**
@@ -714,4 +755,4 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
   }
 }
 
-export default { createPiSessionHost, createStandInSubject, pickSessionMeta, textOfUserMessage }
+export default { createPiSessionHost, createStandInSubject, pickSessionMeta, pickModelSelection, textOfUserMessage }

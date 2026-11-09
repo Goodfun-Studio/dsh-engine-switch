@@ -10,6 +10,10 @@
 #   · `insert.name` 的相对路径是**相对补丁文件目录**解析的，故 ./index.js 指本目录插件。
 #   · forceEngine: 'pi' → 路由器忽略 marker，把所有 create/resume 一律交给 pi 引擎。
 #   · pi.agentDir 指向工作区内已播种的 .pi-agent（pi 子进程缺它会因写锁文件 EPERM 直接崩）。
+#   · pi.provider / pi.model 是**回落用**的钉死值（L8 起语义）：正常情况下用会话里选中的模型，
+#     仅当选区不在 pi 能跑的目录里（或 OAR 列不出来）时才回落到这一对值，并在证据里记
+#     `modelSource: fallback|config` + 原因。endo-pi.sh 的 MODEL_PINNED 断言读的是
+#     `effectiveModel`（= pi 读回的生效值），因此回落路径下它仍然等于这个钉死值。
 - insert:
     - id: engine-switch-real-pi
       name: ./index.js
