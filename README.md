@@ -106,14 +106,16 @@ plugin_manager install_bundle
 | 维度 | 决定什么 | 在哪选 |
 | --- | --- | --- |
 | **Agent Preset**（业务预设） | 系统提示词模板 / 角色 / 工具插件集 | 新建任务页的预设 chip（原生四种：标准 / PTC / 极简 / 创造） |
-| **Engine**（底座引擎） | 底座由谁驱动：DSH 原生 AgentLoop / OAR 驱动的 pi / 回声 | 主会话框上的「⚡ 引擎」下拉 Chip、`/engine` 命令、插件设置字段 `engine`、或请求 marker |
+| **Engine**（底座引擎） | 底座由谁驱动：DSH 原生 AgentLoop / OAR 驱动的 pi / 回声 | 新会话起始页上的「⚡ 引擎」下拉 Chip、`/engine` 命令、插件设置字段 `engine`、或请求 marker |
 
 所以「Pi 引擎」**不在**预设下拉框里（`cordis.patch.yml` 里不再声明任何 preset）。
 引擎走自己的入口，四个都可用：
 
-1. **主会话框上的「⚡ 引擎」下拉 Chip**（L6 新增，推荐）：
-   - 位置一：**新会话起始页**那一行右侧，与「工作目录」chip / 预设 chip 同排（`conversation.hero.options`）；
-   - 位置二：**输入框卡片上方**的通栏区右侧，与宿主自己的 Queue / Todo / Goal 同一排（`conversation.input.dock`）；
+1. **新会话起始页上的「⚡ 引擎」下拉 Chip**（L6 新增，L9 收敛为单枚，推荐）：
+   - 位置：**新会话起始页**那一行右侧，与「工作目录」chip / 预设 chip 同排（`conversation.hero.options`）；
+   - 早先它还在**输入框卡片上方**的通栏区（`conversation.input.dock`）挂过第二枚，真机上同一张新任务页会同时
+     出现两枚「引擎：Pi 引擎」（与预设同排的那枚 + 输入框正上方孤立浮动的那枚），L9 已按老板截图把那条注册移除 ——
+     现在 Chip **只此一处**；
    - 点开是屏幕正中的选择面板（挂在 `shell.overlay`），三个选项带一句话说明，当前值带「当前」徽标；
    - 它写的就是下面第 3 条的 `engine` 字段（走 DSH 通用的 `ctx.remote.settings.update`，带 revision 乐观锁），
      所以与 `/engine pi` / 设置页改的是**同一个值**；写成功后 Chip 立刻显示新值，
@@ -241,10 +243,11 @@ bash rollback.sh
 
 本项目包含九个可复跑的测试套件（全部不调模型，除 `endo-pi.sh` 与 `endo-session.sh`）：
 
-### 1. client-ui.sh（「⚡ 引擎」客户端 bundle，83 条）
+### 1. client-ui.sh（「⚡ 引擎」客户端 bundle，81 条）
 
 验证 L6 的浏览器半边：`package.json` 的 `dsh.client` 声明与 `exports["./client"]` 能被宿主
-`resolveMeta()` 认出来、模块只依赖平台种子、三个插槽注册正确、取值纪律（近似值不落盘）、
+`resolveMeta()` 认出来、模块只依赖平台种子、两个插槽注册正确（Chip 只挂
+`conversation.hero.options`，输入框上方那枚重复挂载已按 L9 移除）、取值纪律（近似值不落盘）、
 命名空间定位（含 fork 改名与邻居不误认的负向断言）、写盘参数与 host 拒绝路径，
 并用一个**最小 React 运行时**真的把 `EngineChip` / `EnginePickerOverlay` 渲染出来、真的点：
 
@@ -252,7 +255,7 @@ bash rollback.sh
 bash client-ui.sh
 ```
 
-期望输出：`SYNTAX_OK`、`SUMMARY: 83 HIT / 0 MISS`、`RESULT: PASS`、`CLIENT_UI_DRIVER: OK`、退出码 0。
+期望输出：`SYNTAX_OK`、`SUMMARY: 81 HIT / 0 MISS`、`RESULT: PASS`、`CLIENT_UI_DRIVER: OK`、退出码 0。
 
 > 为什么不是「grep client.js」：客户端 bundle 在 **boot 关键路径**上，语法错或 require 到
 > 非平台模块会让整页停在 "Failed to load plugins"；所以这一套真的执行 factory、真的渲染。

@@ -15,7 +15,7 @@
  * 覆盖四类断言：
  *   A 声明面：package.json 的 `dsh.client` + `exports["./client"]` 能被 host 的
  *     `resolveMeta()` 认出来（bundle 能不能被 serve 的前提）
- *   B 装载面：模块形状 / 只用平台种子 / 不 inject 可选服务 / 不碰 document / 三个插槽注册
+ *   B 装载面：模块形状 / 只用平台种子 / 不 inject 可选服务 / 不碰 document / 两个插槽注册
  *   C 判定面：取值纪律与命名空间定位（负向防误杀：近似取值不落盘、邻居命名空间不误认）
  *   D 交互面：Chip 文案 → 点开浮层 → 选中 → 写盘参数 → 成功关闭 / 失败不关 / 读不到不崩
  *
@@ -393,22 +393,22 @@ try {
 check('B_LOAD', 'apply(fakeCtx) 不抛（异常会被渲染层兜住，但 boot 期抛会拖垮整页）', applyThrew === null)
 check(
   'B_LOAD',
-  '注册了三个插槽：hero.options / input.dock / shell.overlay',
+  '注册了两个插槽：hero.options / shell.overlay',
   JSON.stringify(hostA.slots.registered.map((row) => row.target)) ===
-    JSON.stringify(['conversation.hero.options', 'conversation.input.dock', 'shell.overlay']),
+    JSON.stringify(['conversation.hero.options', 'shell.overlay']),
+)
+check(
+  'B_LOAD',
+  '不再往 conversation.input.dock 注入（否则新任务页会同时出现两枚「引擎」Chip —— 老板截图里的重复项）',
+  !hostA.slots.injected.includes('conversation.input.dock') &&
+    JSON.stringify(hostA.slots.injected) === JSON.stringify(['conversation.hero.options', 'shell.overlay']),
 )
 const heroReg = hostA.slots.registered[0]
-const dockReg = hostA.slots.registered[1]
-const overlayReg = hostA.slots.registered[2]
+const overlayReg = hostA.slots.registered[1]
 check(
   'B_LOAD',
   'hero chip：order 30（紧挨 Agent 预设）、id 自带、locale 指向本插件字典',
   heroReg.options.order === 30 && heroReg.options.id === 'engine-hero' && heroReg.options.locale === moduleA.module.NS && heroReg.component === moduleA.module.EngineChip,
-)
-check(
-  'B_LOAD',
-  '主会话框上方的 chip 与 hero chip 是同一枚组件（一份真话，不各画一个）',
-  dockReg.options.id === 'engine-dock' && dockReg.component === moduleA.module.EngineChip && dockReg.options.order === 30,
 )
 check(
   'B_LOAD',
@@ -417,13 +417,9 @@ check(
 )
 check(
   'B_LOAD',
-  '两个 chip 的 inject() 都真的给出 t（文案走 client locale，不硬编码在组件里）',
-  typeof heroReg.options.inject().t === 'function' && typeof dockReg.options.inject().t === 'function' && heroReg.options.inject().t('chipPrefix') === '引擎',
-)
-check(
-  'B_LOAD',
-  '外壳形态跟插槽走：hero chip 传 variant=inline（inline 流，不撑满那一行），dock chip 传 variant=dock（通栏右对齐）',
-  heroReg.options.inject().variant === 'inline' && dockReg.options.inject().variant === 'dock',
+  'hero chip 的 inject() 真的给出 t（文案走 client locale，不硬编码在组件里），且只此一项（dock 变体已随重复 Chip 一起移除）',
+  typeof heroReg.options.inject().t === 'function' && heroReg.options.inject().t('chipPrefix') === '引擎' &&
+    JSON.stringify(Object.keys(heroReg.options.inject())) === JSON.stringify(['t']),
 )
 check(
   'B_LOAD',
@@ -540,7 +536,7 @@ const forkWrite = await C.writeEngineSelector(hostFork.ctx, 'echo', { ns: forkRe
 check('C_WRITE', '被 fork 改名的命名空间：读到的 ns 原样用于写（不写回硬编码的 engine-switch）', forkWrite.ok === true && hostFork.calls.update[0].ns === 'some-fork-name')
 
 // ===========================================================================
-// D. store 状态机：两个 chip 共用一份真话
+// D. store 状态机：Chip 与浮层共用一份真话（同一份 selector store）
 // ===========================================================================
 const storeHost = makeHost({ settings: { describe: { ok: true, value: { writable: true, namespaces: [nsRow('native', 7)] } }, update: { ok: true, value: nsRow('pi', 8) } } })
 const storeMod = makeModule()
@@ -553,7 +549,7 @@ const seen = []
 store.subscribe((snapshot) => seen.push(snapshot.engine))
 await store.ensure()
 await store.ensure()
-check('D_STORE', 'ensure() 首次读一次、再次 ensure 不重复读（两个 chip 不会各打一次 describe）', storeHost.calls.describe === 1)
+check('D_STORE', 'ensure() 首次读一次、再次 ensure 不重复读（同一份 store 不会各打一次 describe）', storeHost.calls.describe === 1)
 check('D_STORE', '读成功后快照是 ready + 当前值', store.get().status === 'ready' && store.get().engine === 'native' && store.get().revision === 7)
 const selectOk = await store.select('pi')
 check(
@@ -643,11 +639,11 @@ async function renderChipAndOverlay(options = {}) {
   check('E_UI', `异步读完后 Chip 是「⚡ 引擎：Pi 引擎 ▾」（实测："${chipText}"）`, chipText.includes('⚡') && chipText.includes('引擎') && chipText.includes('Pi 引擎') && chipText.includes('▾'))
   const chipNode = jsxRuntime.byAttr(scene.chipRoot, 'data-dsh-engine')[0]
   check('E_UI', 'Chip 带 data-dsh-engine="pi" / data-dsh-engine-state="ready"（机器可断言的选择器）', chipNode?.props?.['data-dsh-engine'] === 'pi' && chipNode?.props?.['data-dsh-engine-state'] === 'ready')
-  const chipWrapper = jsxRuntime.byAttr(scene.chipRoot, 'data-dsh-engine-variant')[0]
+  const chipWrapper = scene.chipRoot.hostNode
   check(
     'E_UI',
-    'hero 里的外壳是 inline（宽度由内容决定），且没有 width:100%（否则会把预设 chip 挤开）',
-    chipWrapper?.props?.['data-dsh-engine-variant'] === 'inline' && chipWrapper?.props?.style?.width === undefined && chipWrapper?.props?.style?.display === 'inline-flex',
+    'Chip 外壳是 inline（宽度由内容决定），且没有 width:100%（否则会把预设 chip 挤开）',
+    chipWrapper?.props?.style?.width === undefined && chipWrapper?.props?.style?.display === 'inline-flex',
   )
   check('E_UI', '浮层未点开时不渲染任何东西（不占屏、不抢焦点）', scene.overlayRoot.hostNode === null)
   const describesBeforeOpen = scene.host.calls.describe
@@ -778,21 +774,16 @@ async function renderChipAndOverlay(options = {}) {
 }
 
 {
-  // dock 变体：同一枚组件在输入框上方的通栏里要占满整行、右对齐
+  // 一枚 Chip 就够：注册表里不存在第二处挂载点（真机上两枚「引擎」的直接原因）
   const mod = makeModule().module
   const host = makeHost({ settings: { describe: { ok: true, value: { writable: true, namespaces: [nsRow('native', 1)] } }, update: { ok: true, value: nsRow('native', 2) } } })
   mod.apply(host.ctx)
-  const dockEntry = host.slots.registered.find((row) => row.options?.id === 'engine-dock')
-  const rt = RT
-  const root = rt.createRoot(dockEntry.component, { ...dockEntry.options.inject() })
-  await settle()
-  const wrapper = jsxRuntime.byAttr(root, 'data-dsh-engine-variant')[0]
+  const chipEntries = host.slots.registered.filter((row) => row.component === mod.EngineChip)
   check(
     'E_UI',
-    'dock 里的外壳是 width:100% + justify-content:flex-end（与宿主 Queue/Todo/Goal 同款右对齐）',
-    wrapper?.props?.['data-dsh-engine-variant'] === 'dock' && wrapper?.props?.style?.width === '100%' && wrapper?.props?.style?.justifyContent === 'flex-end',
+    '整页只注册一枚引擎 Chip（hero 那一处），注册表里没有 engine-dock 第二处挂载点',
+    chipEntries.length === 1 && chipEntries[0].options.id === 'engine-hero' && host.slots.registered.every((row) => row.options?.id !== 'engine-dock'),
   )
-  check('E_UI', '两处外观差异只来自插槽变体，组件与数据源是同一份', dockEntry.component === host.slots.registered.find((row) => row.options?.id === 'engine-hero').component)
 }
 
 console.log(`\nSUMMARY: ${pass} HIT / ${fail} MISS`)

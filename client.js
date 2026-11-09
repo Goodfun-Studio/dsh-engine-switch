@@ -1,19 +1,19 @@
 /**
  * @local/dsh-engine-switch —— 客户端半边（浏览器 bundle）
  *
- * 这是 L6 的交付物：把「引擎」做成**主会话框上的独立下拉 Chip**（Engine ⊥ Preset 的 UI 面），
+ * 这是 L6 的交付物：把「引擎」做成**新会话起始页上的独立下拉 Chip**（Engine ⊥ Preset 的 UI 面），
  * 与 Agent 预设（标准 / PTC / 极简 / 创造）并排展示，两者互不绑架。
  *
- * ── 它挂在哪两个官方插槽上 ────────────────────────────────────────────────
+ * ── 它挂在哪个官方插槽上 ────────────────────────────────────────────────
  *
  *   ① `conversation.hero.options`（order 30）—— 新会话起始页那一行右侧的选项区，
  *      与「工作目录」chip / Agent 预设同排（DSH 官方契约：list/session，
  *      "Compact options right-aligned in the New Session row after the workspace and preset controls"）。
- *   ② `conversation.input.dock`（order 30）—— 输入框卡片**上方**的通栏区
- *      （同上契约："Full-width entries above the composer card"，宿主自己的
- *      QueueDock / TodoDock / GoalDock 就在这一排）。即老板说的「主会话框上方」。
+ *      ⚠️ Chip **只挂这一处**：早先还往 `conversation.input.dock`（输入框上方通栏）
+ *      挂过第二枚，真机上新任务页于是出现两枚「引擎：Pi 引擎」（与预设同排的那枚 +
+ *      输入框正上方孤立浮动的那枚）；L9 按老板截图把那一条注册移除了。
  *
- *   点击 Chip 弹出的选择面板挂在 ③ `shell.overlay`（整帧浮层，list/root）——
+ *   点击 Chip 弹出的选择面板挂在 ② `shell.overlay`（整帧浮层，list/root）——
  *   官方契约原话："Frame-wide floating layer, above every column and outside their scroll
  *   containers… entries order among themselves. The layer itself is click-through — entries
  *   opt back into pointer events"。所以浮层**不往 document.body 追加 DOM**，
@@ -161,19 +161,12 @@ window.__ModuleLoader__.load({
 		};
 
 		const styles = {
-			// 插槽外壳：与「工作目录」chip 同排时不能撑满（hero 那一行是 inline 流），
-			// 而在输入框上方的通栏里要占满整行、把胶囊放在右端（与宿主自己的 Queue/Todo/Goal 同款对齐）。
+			// 插槽外壳：与「工作目录」chip 同排（hero 那一行是 inline 流）——宽度由内容决定、不撑满，
+			// 免得把旁边的预设 chip 挤开。
 			chipRowInline: {
 				display: "inline-flex",
 				alignItems: "center",
 				gap: "6px",
-			},
-			chipRowDock: {
-				display: "flex",
-				justifyContent: "flex-end",
-				alignItems: "center",
-				gap: "6px",
-				width: "100%",
 			},
 			chipButton: {
 				font: "inherit",
@@ -452,14 +445,14 @@ window.__ModuleLoader__.load({
 			};
 		}
 
-		// ── 选择器状态：两个插槽里的 Chip 与浮层共用一份 ──────────────────────
+		// ── 选择器状态：Chip 与浮层共用一份 ────────────────────────────────
 
 		/**
 		 * 引擎选择器的共享快照（一个极简 store）：
 		 * 读、写、乐观锁、失败文案都收在这里，组件只做渲染。
 		 *
-		 * 为什么不做成「每个 Chip 各自 fetch」：hero 那一行与输入框上方是**两个独立插槽组件**，
-		 * 各读一次会出现同一屏两个 Chip 短暂不同步；而写盘只有一个权威值，
+		 * 为什么不做成「Chip 各自 fetch」：Chip 与浮层是**两个独立插槽组件**，
+		 * 各读一次会出现「面板里的当前值」与「Chip 上的值」短暂不同步；而写盘只有一个权威值，
 		 * 两份状态就是两份真话。store 由 `apply` 挂 reader（见 attachBridge）。
 		 */
 		function createSelectorStore() {
@@ -654,7 +647,7 @@ window.__ModuleLoader__.load({
 		/**
 		 * 「⚡ 引擎：<当前值> ▾」胶囊。
 		 *
-		 * 挂在 `conversation.hero.options` 与 `conversation.input.dock` 两处（同一枚组件）。
+		 * 挂在 `conversation.hero.options`（新会话起始页那一行右侧，与工作目录 / 预设同排）。
 		 * 状态如实表达：
 		 *   - 读盘中 → 「引擎：读取中…」；
 		 *   - 读到了 → 「引擎：原生 / Pi 引擎 / 回声引擎」；
@@ -664,8 +657,6 @@ window.__ModuleLoader__.load({
 		function EngineChip(props) {
 			const t = typeof props?.t === "function" ? props.t : (key) => key;
 			const store = props?.store ?? selectorStore;
-			// 外壳形态由所在插槽决定（`inject` 传进来）：hero 那一行是 inline 流，通栏那一行要占满右对齐。
-			const docked = props?.variant === "dock";
 			const [snapshot, setSnapshot] = react.useState(() => store.get());
 
 			react.useEffect(() => {
@@ -682,8 +673,7 @@ window.__ModuleLoader__.load({
 			const title = ready && label !== null ? t("chipTitle") : `${t("chipUnavailable")}：${snapshot.error ?? "unknown"}${snapshot.detail === null || snapshot.detail === undefined ? "" : ` (${snapshot.detail})`}`;
 
 			return jsxRuntime.jsx("div", {
-				style: docked ? styles.chipRowDock : styles.chipRowInline,
-				"data-dsh-engine-variant": docked ? "dock" : "inline",
+				style: styles.chipRowInline,
 				children: jsxRuntime.jsxs("button", {
 					type: "button",
 					style,
@@ -859,24 +849,16 @@ window.__ModuleLoader__.load({
 			}, "@local/dsh-engine-switch: selector refresh");
 
 			// ① 新会话起始页：与「工作目录」chip / Agent 预设同排（order 30 = 紧挨预设）。
+			// 只此一处 —— 输入框上方的 `conversation.input.dock` 那枚在真机上与它重复，已移除（L9）。
 			ctx.slots.inject("conversation.hero.options", () => ctx.slots.register({
 				name: "conversation.hero.options",
 				id: "engine-hero",
 				order: 30,
 				locale: NS,
-				inject: () => ({ t, variant: "inline" }),
+				inject: () => ({ t }),
 			}, EngineChip));
 
-			// ② 主会话框上方（输入框卡片上方的通栏区，宿主自己的 Queue/Todo/Goal 就在这一排）。
-			ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
-				name: "conversation.input.dock",
-				id: "engine-dock",
-				order: 30,
-				locale: NS,
-				inject: () => ({ t, variant: "dock" }),
-			}, EngineChip));
-
-			// ③ 选择浮层：整帧浮层插槽，居中显示，不往 document.body 追加 DOM。
+			// ② 选择浮层：整帧浮层插槽，居中显示，不往 document.body 追加 DOM。
 			ctx.slots.inject("shell.overlay", () => ctx.slots.register({
 				name: "shell.overlay",
 				id: "engine-picker",

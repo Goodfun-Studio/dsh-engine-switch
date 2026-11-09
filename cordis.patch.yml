@@ -17,9 +17,9 @@
 #   ① 斜杠命令 `/engine [native|pi|echo]`（输入区域；host 侧注册，见 engine-command.mjs）
 #   ② 本插件自己的配置字段 `engine`（volatile ⇒ 设置页可编辑、实时生效、写回 profile patch）
 #   ③ 请求级 marker（`options.meta.engine` / `options.engine`，给 headless / ACP / 脚本按次钉死）
-#   ④ **主会话框上的「⚡ 引擎」下拉 Chip**（客户端半边 client.js：新会话起始页
-#      `conversation.hero.options` 与输入框上方 `conversation.input.dock` 各一枚，
-#      点开是 `shell.overlay` 里的选择面板）——它写的就是 ② 的那个值，
+#   ④ **新会话起始页上的「⚡ 引擎」下拉 Chip**（客户端半边 client.js：单枚挂在
+#      `conversation.hero.options`，与工作目录 chip / 预设 chip 同排；点开是
+#      `shell.overlay` 里的选择面板）——它写的就是 ② 的那个值，
 #      走 DSH 通用的 `ctx.remote.settings.update`，不是第二套权威。
 #
 # 于是「创造模式 + Pi 引擎」「标准模式 + Pi 引擎」都是合法且独立的组合：preset 照旧在
