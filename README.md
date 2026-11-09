@@ -123,12 +123,6 @@ bash rollback.sh
 - **根因**：插件的 settings 命名空间未就绪。通常发生在刚修改了 patch 配置但未重启桌面端，或 profile 的 `cordis.patch.yml` 中未正确加载 `engine-switch`。
 - **解决**：确认 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `insert:` 节点下包含 `engine-switch`，退出并重新启动桌面端加载最新 bundle 即可。
 
-### 3. 主会话出现两个「⚡ 引擎」Chip
-
-- **现象**：在新会话页面中，既在顶部预设旁看到 Chip，又在输入框卡片正上方看到孤立浮动的 Chip。
-- **根因与状态**：旧版曾同时向 `conversation.hero.options` 与 `conversation.input.dock` 两处插槽挂载。L9 已彻底移除 `conversation.input.dock` 注册，单页仅保留一枚。
-- **解决**：若界面仍显示两枚，说明桌面端加载的是旧版客户端 bundle 缓存，重启桌面端或在窗口中执行刷新即可更新为单枚 Chip。
-
 ---
 
 ## 快速开发与测试概览
