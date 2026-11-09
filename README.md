@@ -18,6 +18,52 @@ Pi 引擎    （预留其他引擎）
 - **Adapter**：负责 DSH ↔ OAR 的双向转换（输入/输出/错误/abort/steer 等）
 - **Runtime**：引擎实际执行层（当前仅实现 Pi）
 
+模块划分：
+
+| 文件 | 职责 |
+| --- | --- |
+| `index.js` | 插件入口：接管 `ctx.agents.factory`、路由器接线、事件桥、证据落盘 |
+| `engine-intent.mjs` | 引擎意图判定（forceEngine / marker / 会话绑定 / preset 兼容 / 选择器 / 默认） |
+| `engine-command.mjs` | `/engine` 命令的语法与文案 |
+| `oar-engine.mjs` | OAR 适配器：真起 pi 子进程、把文本映射成 DSH 流式帧 |
+| `pi-session.mjs` | **pi 会话/Agent 生命周期宿主**：建会话（落盘）→ 注册 Agent → 首轮 durable turn（见下节） |
+| `client.js` | 桌面端「⚡ 引擎」Chip 的客户端半边 |
+
+### pi 会话/Agent 在 DSH 里长什么样（L7）
+
+光把 pi 的文本"塞回去"不够：桌面端（HTTP/Web RPC 面）的会话身份、持久化、Agent 注册、
+流式帧路由都是**上游硬契约**，任何一条不满足都会在建会话时炸。`pi-session.mjs` 就是
+把「pi 会话在 DSH 里的一等公民化」收敛成一处，顺序逐字照抄上游 `AgentLoop` 的创建事务：
+
+```
+create:                       resume（桌面端重启后打开旧会话）:
+  sessions.prepare(meta.cwd/agentPreset)   sessionPersistence.open(id,'write') → read(0)
+  sessionPersistence.create(header)        sessions.prepare(seed=磁盘事件, meta=存量 header)
+  sessions.enter + announce                （补写 fromRestore 追加的 session/end-seed，
+  agents.enter + announce（替身身份=会话 id）  对齐持久化游标）
+  首轮：turn/start → user/message →         sessions.enter + announce
+        step/start → assistant/message       agents.enter + announce
+        （含 settlement 字段 turn/step/stream）
+        → step/end → turn/end → flush
+```
+
+关键不变量（改这两处前先读 `session-lifecycle.mjs` 的断言）：
+
+1. **`agent.id` 必须等于真实会话 id**（`session-<uuid>`）——
+   上游 `sessionController.create()` 逐字取 `agent.id` 当会话身份，
+   `AgentRegistry.enter()` 也硬校验 `agent.id === agent.session.id`；
+2. **会话必须有 cwd 元数据且真的落盘** —— `workspace.attachSession()` /
+   `readState` 校验的就是 header 里的 cwd，冷读走持久化；
+3. **Agent 必须注册进 `ctx.agents`** —— `session/prompt` 的准入检查是
+   `ctx.agents.get(agent.id) !== agent → session/not-found`；
+4. **流式帧挂在 `agent.session.id` 下** —— 前端 assistant stream 按会话 id 订阅；
+5. **durable `assistant/message` 必须带 settlement 字段**（`turn` / `step` / `stream`）——
+   缺了存盘日志会在冷读时被判 `corrupt: invalid settlement fields`，重启后打不开。
+
+历史现场（L7 修的就是它）：改造前替身 id 是 `engine-switch:oar-pi:<sessionId>`，
+于是桌面端点「新建会话」直接报
+`session/workspace-attach-failed: session persistence holds no such session`。
+
 ## 安装
 
 使用 DSH 插件管理器安装：
@@ -205,6 +251,39 @@ bash endo-pi.sh
 - 本机 DSH 源码抽取树（`.recon/dsh-src`），用于获取真实契约定义
 - Pi 客户端可正常访问
 
+### 7. session-lifecycle.sh（pi 会话/Agent 生命周期，46 条）
+
+不调模型、不联网的确定性套件：真实 cordis Context + 真实 AgentRegistry + 真实 SessionStore
++ 真实 jsonl 持久化（临时根），把 `@botiverse/oar` 与原生 target 换成替身。
+覆盖 L7 的全部关键不变量 + **Native 负向防误杀** + 冷重启 resume：
+
+```bash
+bash session-lifecycle.sh
+```
+
+期望输出：`SUMMARY: 46 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+
+断言分组：`PI_IDENTITY`（身份无前缀泄漏）、`PI_SESSION`（live store + cwd/preset 元数据）、
+`PI_PERSIST`（落盘 + 冷读复原彩排 + settlement 字段）、`PI_REGISTRY`（注册进 ctx.agents）、
+`PI_STREAM`（帧挂真实会话 id）、`PI_TURN`（首轮 durable turn + 续号）、
+`NEG_NATIVE`（engine=native 严格直通、零 pi 污染）、`RESUME`（新进程冷开旧会话并接着聊）、
+`UNLOAD`（卸载不留无主条目）。
+
+### 8. endo-session.sh（真机 Web Host 新建会话 + 首轮 + 重启续聊，18 条）
+
+在**隔离 DSH_HOME** 下起一个真实 `dsh web` 宿主（与桌面端同一套 session controller），
+用与桌面端逐字相同的 RPC 信封打 `session/create` → `session/state` → `session/prompt`，
+再**重启宿主**用同一个会话续聊：
+
+```bash
+bash endo-session.sh
+```
+
+期望输出：`SUMMARY: 18 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+
+**⚠️ 注意**：会调用**真实模型**（≤2 次）、需要 `.pi-agent/` 凭据与 `.recon/dsh-src` 抽取树；
+真实 `~/.dsh` 全程只读指纹（断言 `REAL_HOMEDIR_UNTOUCHED`）。
+
 ### 另外三条零成本回归
 
 ```bash
@@ -238,12 +317,16 @@ bash rehearse-rollback.sh                  # 回滚彩排（20 条，含 DESKTOP
 3. **Steer / Abort 未实现**：用户中断（abort）和引导（steer）操作未处理
 4. **模型必须显式钉死**：在 `real-pi-patch.yml` 中必须指定 `model` 字段（如 `pi-mini-prod`），否则 OAR 会根据自身逻辑自动选择模型，可能与预期不符
 5. **引擎选择器是「新任务默认」而不是「当前任务开关」**：引擎只在建 Agent 时能定，见上文的语义边界一节
-6. **会话→引擎绑定只在进程内**：桌面端重启后，存量会话重新按选择器决定引擎（不跨重启记忆会话身份）
-7. **pi 路由目前不把 DSH 历史交给 pi**：换引擎后继续同一会话，pi 只看到本次输入；跨引擎续跑同一会话会丢上下文
+6. **会话→引擎绑定只在进程内**：桌面端重启后，存量会话重新按选择器（或会话 header 里的 `agentPreset`）决定引擎
+7. **pi 只吃本轮用户文本**：L7 之后 pi 会话的历史存在 DSH 会话里、重启也能冷开接着聊，但送给 pi 的 prompt 仍然**只有本轮用户文本**（不把 DSH 历史喂给 pi）；跨引擎续跑同一会话时，pi 侧不掌握前文
 8. **引擎 Chip 改的是全局选择器**：点完不会让当前这条会话当场换引擎（语义边界同上），
    也不能在 UI 上「按会话」点选 —— 后者需要一等公民的活体换装口，第三方插件没有
 9. **引擎 Chip 只在 Web / 桌面端界面有**：headless / ACP 场景依旧只能靠 `/engine` 或请求 marker
-10. **`endo-pi.sh` 有一条天然会抖的断言**：它要求真模型逐字复述 20 字符随机 token，
+10. **pi 会话的冷开只服务「本插件建过、且已落盘」的会话**：L7 之前的旧 pi 会话在持久化里
+    没有日志，冷开时插件会**明确报错**（`pi engine: 无法重新载入会话 "…"`）而不是伪造一个空会话
+11. **`steer` 语义仍是「当新一轮」**：pi 引擎一轮 attempt 跑起来就无法中途插话，
+    `steer` 会当成新一轮 turn；`cancel` 只保证「未提交的 attempt 不再写入会话」
+12. **`endo-pi.sh` 有一条天然会抖的断言**：它要求真模型逐字复述 20 字符随机 token，
     模型偶发少输出末尾一个字符就会 FAIL（本轮四次运行中失败一次，重跑即绿）。
     失败时证据 JSON 里的 `piTextLength` / `piTextDeltas` 可用于区分「模型少说」还是「适配器丢分片」
 

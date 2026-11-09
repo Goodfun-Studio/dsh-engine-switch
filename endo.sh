@@ -52,7 +52,7 @@ echo
 # 这不是安装：不写任何 lockfile、不联网、不改 profile/node_modules 内的任何真实文件。
 if [ -z "${DSH_SWITCH_SKIP_LINK:-}" ]; then
   mkdir -p "$SWITCH/node_modules/@deepseek-ai"
-  for _pkg in dsh-agent cordis; do
+  for _pkg in dsh-agent dsh-llm dsh-scope cordis; do
     if [ -e "$UPSTREAM_AI/$_pkg" ] && [ ! -e "$SWITCH/node_modules/@deepseek-ai/$_pkg" ]; then
       ln -sfn "$UPSTREAM_AI/$_pkg" "$SWITCH/node_modules/@deepseek-ai/$_pkg"
       echo "dep-scope: linked @deepseek-ai/$_pkg -> $UPSTREAM_AI/$_pkg"

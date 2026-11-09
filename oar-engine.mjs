@@ -51,6 +51,9 @@ export const OAR_SUBJECT_ID = 'engine-switch:oar-pi'
 export const OAR_DEFAULT_PROVIDER = 'magpie'
 export const OAR_DEFAULT_MODEL = 'auto/deepseek-v4.1-flash'
 
+/** 替身身份的 id 前缀：**只**在没有真实会话 id 时的回退（游离替身，不是会话身份）。 */
+export const OAR_STANDIN_PREFIX = OAR_SUBJECT_ID
+
 /** start 帧的 turn 占位值：pi 这轮没有 durable DSH turn，如实用 0。 */
 export const OAR_PLACEHOLDER_TURN = 0
 
@@ -72,6 +75,14 @@ export function isPiMarked(options) {
 
 /**
  * 造一个 pi subject 替身（与 pi-engine.mjs 同款）。
+ *
+ * **L7 修正：有真实会话 id 时，id 就是那个 id，不再加 `engine-switch:oar-pi:` 前缀。**
+ * 理由有三条，全部来自上游契约（不是口味问题）：
+ *   1. `sessionController.create()` 逐字取 `agent.id` 当会话身份 ⇒ 前缀会变成不存在的 sessionId；
+ *   2. `AgentRegistry.enter()` 硬校验 `agent.id === agent.session.id`；
+ *   3. 流式帧按 `agent.session.id` 路由到前端订阅 ⇒ 身份必须与真实会话一致。
+ * 无会话 id（游离 attempt）时才回退到不带 id 的常量身份。
+ *
  * @param {object|null|undefined} options 调用参数（用于派生可辨识 id）
  */
 export function createPiSubject(options) {
@@ -79,10 +90,8 @@ export function createPiSubject(options) {
     options !== null && typeof options === 'object'
       ? options.sessionId ?? options.id ?? options.seed
       : undefined
-  const id =
-    typeof raw === 'string' && raw.length > 0
-      ? `${OAR_SUBJECT_ID}:${raw}`
-      : OAR_SUBJECT_ID
+  const hasSessionId = typeof raw === 'string' && raw.length > 0
+  const id = hasSessionId ? raw : OAR_STANDIN_PREFIX
   return {
     id,
     session: { id },
@@ -205,6 +214,11 @@ export function createOarFrameMapper(ctx, subject, text, opts = {}) {
  * @param {string} [config.provider] 显式指定 provider（默认 magpie）
  * @param {string} [config.model] 显式指定 model（默认 auto/deepseek-v4.1-flash）
  * @param {string} [config.cwd] 工作目录
+ * @param {object} [config.sessionHost] 会话/Agent 生命周期宿主（pi-session.mjs）：
+ *   ① 每次 attempt 开头问它要身份（`subjectFor`）——有会话时必须是**同一个** Agent 对象，
+ *      否则流式帧与注册表里的身份会一分为二；
+ *   ② create 路径在跑 pi **之前**把会话建好并绑到身份上（`attach`），
+ *      这样帧的 `agent.session.id` 从一开始就是真实会话 id（前端按会话 id 订阅）。
  */
 export function createOarEngine(config = {}) {
   const stats = {
@@ -244,7 +258,12 @@ export function createOarEngine(config = {}) {
     stats.attempts += 1
 
     const o = baseOptions(options)
-    const subject = createPiSubject(options)
+    const sessionHost = config.sessionHost ?? null
+    // 身份来源：宿主优先（已建会话必须复用同一个 Agent 对象），否则引擎自造替身。
+    const subject =
+      (typeof sessionHost?.subjectFor === 'function'
+        ? sessionHost.subjectFor(options, kind)
+        : null) ?? createPiSubject(options)
 
     const record = {
       kind,
@@ -263,9 +282,21 @@ export function createOarEngine(config = {}) {
       frames: [],
       framesEmitted: 0,
       error: null,
+      attachError: null,
       durationMs: 0,
     }
     attempts.push(record)
+
+    // create / resume 路径：先把 DSH 会话建好（或从持久化读回来）再跑 pi。
+    // 放在这里而不是 onPiResult：帧在 runAttempt 里就发出去了，绑定必须更早；
+    // resume 时也只有先把历史读回来，后面的 turn 才会接在正确的 seq 上。
+    if (typeof sessionHost?.attach === 'function') {
+      try {
+        await sessionHost.attach(engineCtx, options, subject, kind)
+      } catch (attachError) {
+        record.attachError = String(attachError?.message ?? attachError)
+      }
+    }
 
     const started0 = Date.now()
 

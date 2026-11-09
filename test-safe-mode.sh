@@ -57,7 +57,7 @@ fi
 # ---------- 运行时依赖符号链接 ----------
 if [ -z "${DSH_SWITCH_SKIP_LINK:-}" ]; then
   mkdir -p "$SWITCH/node_modules/@deepseek-ai"
-  for _pkg in dsh-agent cordis; do
+  for _pkg in dsh-agent dsh-llm dsh-scope cordis; do
     if [ -e "$UPSTREAM_AI/$_pkg" ] && [ ! -e "$SWITCH/node_modules/@deepseek-ai/$_pkg" ]; then
       ln -sfn "$UPSTREAM_AI/$_pkg" "$SWITCH/node_modules/@deepseek-ai/$_pkg"
       echo "dep-scope: linked @deepseek-ai/$_pkg"

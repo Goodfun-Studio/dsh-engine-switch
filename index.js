@@ -47,6 +47,14 @@
  *     chunk / end 帧复用 `agentEvents(ctx, subject)` 构造的 retained dispatcher
  *     （热路径，与真实 AgentLoop 的 `this.dispatch = agentEvents(loopCtx, this)` 同形）。
  *
+ * 会话/Agent 生命周期（L7 修正，见 pi-session.mjs）：
+ *   pi 路由在 create 时**真的建一个 DSH 会话并注册一个 Agent** —— 替身身份就是真实会话 id，
+ *   会话经 `sessionPersistence.create` 落盘 + `sessions.prepare/enter/announce`，
+ *   Agent 经 `agents.enter/announce` 进注册表，首轮交互写成真实的 durable turn 事件。
+ *   缺这一步时：会话身份带 `engine-switch:oar-pi:` 前缀、会话头没有 cwd、
+ *   Agent 不在注册表里 —— 桌面端点「新建会话」直接报
+ *   `session/workspace-attach-failed: session persistence holds no such session`。
+ *
  * 诚实边界（详见 SMOKE-EVIDENCE.md）：
  *   - 本轮**不**创建真实 Agent、**不**接管真实 AgentLoop、**不**调真实模型；
  *     subject 是一个最低限度的替身对象（`kind: 'echo-subject'`），
@@ -87,7 +95,12 @@ import {
 } from './engine-command.mjs'
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
+import {
+  createPiSessionHost,
+  createStandInSubject,
+  sessionIdOfOptions,
+  textOfUserMessage,
+} from './pi-session.mjs'
 
 /** agentPreset 兼容命中后路由到 pi 引擎的默认 preset 名（config.piPreset 的默认值）。 */
 export const DEFAULT_PI_PRESET = 'pi'
@@ -157,6 +170,12 @@ export { agentEvents, emitAgentEvent }
  * （与 pi-engine.mjs 是同一模块实例，可用 === 做身份校验）。
  */
 export { createOarEngine, isPiMarked, PI_ENGINE_ID, PI_PROMPT, PI_OK_MARKER }
+
+/**
+ * 再导出 pi 会话/Agent 生命周期宿主的公开面（pi-session.mjs），
+ * 供测试直接用同一模块实例做单元断言（不再造第二套替身）。
+ */
+export { createPiSessionHost, createStandInSubject }
 
 /** 插件名（日志/效果名可读性）。 */
 export const PLUGIN_NAME = '@local/dsh-engine-switch'
@@ -493,15 +512,16 @@ export function createRouter(nativeTarget, echoEngine, piEngine, hooks = {}) {
     if (typeof notify === 'function') notify(kind, route)
     const result = Reflect.apply(receiver[kind], receiver, [engineCtx, options])
     if (route === 'pi' && typeof hooks.onPiResult === 'function') {
-      // pi 引擎 attempt 是异步的：文本落证据必须发生在把结果交回调用方之前，
-      // 否则 headless 进程可能在 attempt 结算前退出、pi 文本丢失。
+      // pi 引擎 attempt 是异步的：文本落证据 + 会话/Agent 发布必须发生在把结果交回调用方之前，
+      // 否则 headless 进程可能在 attempt 结算前退出、pi 文本丢失，且桌面端会拿到一个
+      // “会话已建但 Agent 还没注册进 ctx.agents”的中间态。
       return Promise.resolve(result).then(
-        (value) => {
-          hooks.onPiResult(kind, value, null, engineCtx, options)
+        async (value) => {
+          await hooks.onPiResult(kind, value, null, engineCtx, options)
           return value
         },
-        (error) => {
-          hooks.onPiResult(kind, null, error, engineCtx, options)
+        async (error) => {
+          await hooks.onPiResult(kind, null, error, engineCtx, options)
           throw error
         },
       )
@@ -659,6 +679,13 @@ export function createEvidenceStore(config = {}) {
     runtimeId: null,
     provider: null,
     effectiveModel: null,
+    // —— pi 会话/Agent 生命周期（桌面端新建会话能不能活下来的可观测面）——
+    /** 进程内已 attach/publish 过的 pi 会话（快照，见 pi-session.mjs 的 snapshot()）。 */
+    piSession: { version: 1, counters: {}, sessions: [] },
+    /** 最近一次生命周期事件（host 回调的事件名 + 细节）。 */
+    piSessionLastEvent: null,
+    /** 生命周期事件顺序表（最多保留 40 条，防止证据无限膨胀）。 */
+    piSessionEvents: [],
     takeoverPhase: 'not-installed',
     failReason: null,
     writes: 0,
@@ -810,6 +837,30 @@ export function createEvidenceStore(config = {}) {
         evidence.piEngineError = error instanceof Error ? error.message : String(error)
       }
       write('pi-text')
+      return evidence
+    },
+    /**
+     * 记一条 pi 会话/Agent 生命周期事件（pi-session.mjs 的 onEvent 回调）。
+     * 只写事实：建会话 / 落盘 / 注册 Agent / turn 提交 / 失败原因，不写用户原文。
+     * @param {string} event 事件名（如 'pi-session/attached'）
+     * @param {object} [detail] 事件细节（sessionId / cwd / durable / error …）
+     * @returns {object} 证据对象
+     */
+    recordPiSession(event, detail = {}) {
+      evidence.piSessionLastEvent = { event, detail }
+      if (evidence.piSessionEvents.length >= 40) evidence.piSessionEvents.shift()
+      evidence.piSessionEvents.push({ event, detail })
+      if (event === 'pi-session/error') evidence.piSessionError = detail.error ?? null
+      write('pi-session')
+      return evidence
+    },
+    /**
+     * 记 pi 会话宿主的当前快照（已 attach / 已 publish / 已落盘会话表）。
+     * @param {object} snapshot pi-session.mjs 的 host.snapshot()
+     * @returns {object} 证据对象
+     */
+    recordPiSessionSnapshot(snapshot) {
+      if (snapshot !== null && typeof snapshot === 'object') evidence.piSession = snapshot
       return evidence
     },
   }
@@ -1092,6 +1143,17 @@ export function apply(ctx, config = {}) {
       typeof agentsCtx.get === 'function' ? agentsCtx.get('agentLoop') : undefined
     const ctxAgentLoop = ctxAgentLoopService?.[CORDIS_ORIGINAL] ?? ctxAgentLoopService
     const echoEngine = createEchoEngine(config)
+    // pi 会话/Agent 生命周期宿主（L7）：服务全部现取（ctx.get），拿不到就如实跳过。
+    // 事件回调只写旁路证据，不影响主流程。
+    const piSessionHost = createPiSessionHost({
+      get: (name) => (typeof ctx.get === 'function' ? ctx.get(name) : undefined),
+      // 事件回调只写旁路证据，不影响主流程；每条事件顺便刷新一次宿主快照
+      // （真机断言读的就是 piSession.sessions[].durable / published）。
+      onEvent: (event, detail) => {
+        store.recordPiSession(event, detail)
+        store.recordPiSessionSnapshot(piSessionHost.snapshot())
+      },
+    })
     // 真引擎：pi 引擎只在被 marker 命中时才 spawn 子进程（懒启动，见 pi-engine.mjs）。
     const piEngine = createOarEngine({
       agentDir: piConfig.agentDir,
@@ -1103,6 +1165,7 @@ export function apply(ctx, config = {}) {
       cliPath: piConfig.cliPath,
       cwd: piConfig.cwd,
       piModulePath: piConfig.piModulePath,
+      sessionHost: piSessionHost,
     })
     const router = createRouter(nativeTarget, echoEngine, piEngine, {
       forceEngine,
@@ -1116,107 +1179,74 @@ export function apply(ctx, config = {}) {
         store.recordEngineIntent(resolution.engine, resolution.source, bindings)
       },
       onPiResult: async (kind, result, error, engineCtx, options) => {
-        // createAgent 阶段：只建会话，不跑 pi（把 pi 留给 followup）
-        if (kind === 'createAgent') {
-          const sessionId = options?.sessionId
-          if (typeof sessionId === 'string' && sessionId.length > 0) {
-            // prepare + enter + announce（只做一次），保留 Session
-            const sessions = ctx.get('sessions')
-            let session = null
-            if (sessions !== undefined) {
-              session = sessions.prepare(sessionId, {})
-              sessions.enter(session)
-              sessions.announce(session)
-            }
-            
-            // 把真实 Session 注入到 result.subject，作为 agent.session 暴露
-            if (session !== null && result && result.subject) {
-              result.subject.session = session
-              
-              // 实现真实的 followup/whenIdle/status 契约
-              let inFlight = Promise.resolve()
-              let status = 'idle'
-              
-              result.subject.followup = (message) => {
-                status = 'running'
-                inFlight = (async () => {
-                  try {
-                    // 从 message 提取真实用户文本（headless 传的是 createUserMessage）
-                    let userText = ''
-                    if (message && Array.isArray(message.content)) {
-                      for (const block of message.content) {
-                        if (block && block.type === 'text' && typeof block.text === 'string') {
-                          userText += block.text
-                        }
-                      }
-                    }
-                    
-                    // 跑一次 pi，传入真实用户文本
-                    const piResult = await piEngine.runAttempt(engineCtx, {
-                      ...options,
-                      prompt: userText,
-                    }, 'resume')
-                    
-                    const piText = typeof piResult.piText === 'string' ? piResult.piText : piResult.text ?? ''
-                    
-                    // 写入 piText/piTextLength 供断言读取
-                    store.recordPiResult('resume', piResult, null)
-                    
-                    // followup 阶段：直接向保留的 Session 追加三段事件并 flush
-                    const turn = 1
-                    const step = 1
-                    session.append('turn/start', { turn })
-                    
-                    const assistantMessage = createAssistantMessage({ 
-                      content: [{ type: 'text', text: piText }], 
-                      source: { provider: 'pi', model: 'pi' } 
-                    })
-                    session.append('assistant/message', { turn, step, message: assistantMessage }, { surfaceOp: 'append' })
-                    
-                    session.append('turn/end', { turn, reason: { kind: 'completed' } })
-                    
-                    // flush（让事件持久化）
-                    await sessions.flush(session)
-                    
-                    store.evidence.sessionId = sessionId
-                    store.evidence.assistantMessageAppended = true
-                    store.evidence.committedText = piText
-                    store.evidence.commitError = null
-                  } catch (e) {
-                    store.evidence.sessionId = sessionId ?? null
-                    store.evidence.assistantMessageAppended = false
-                    store.evidence.committedText = null
-                    store.evidence.commitError = String(e && e.message ? e.message : e)
-                  } finally {
-                    status = 'idle'
-                  }
-                })()
-                return inFlight
-              }
-              
-              result.subject.whenIdle = () => inFlight
-              
-              Object.defineProperty(result.subject, 'status', {
-                get: () => status,
-                enumerable: true,
-              })
-            }
-            
-            // 包装成 headless 期望的 {agent} 结构
-            if (result && result.subject) {
-              result.agent = result.subject
-            }
+        const sessionId = sessionIdOfOptions(options)
+        const subject = result?.subject ?? null
+        // createAgent 之外的阶段（resume / followup 里的 attempt）：结果照旧记证据
+        // （piText / piEngineError / runtimeId … 字段名与语义与改造前一致）。
+        if (kind !== 'createAgent') store.recordPiResult(kind, result, error)
+        if (sessionId !== null && subject !== null) {
+          if (error !== undefined && error !== null && kind === 'createAgent') {
+            store.recordPiResult(kind, null, error)
           }
-        } else {
-          // resume 阶段：记录 pi 结果（但 resume 现在不会被调用，因为 pi 在 followup 里）
-          store.recordPiResult(kind, result, error)
+          // 发布：把替身注册进 ctx.agents（enter + announce），并装上
+          // followup/whenIdle/status/inbox/model 的 Agent 表面契约。
+          // 会话本身已经在引擎的 runAttempt 里 attach 完毕（那里才有身份可绑、帧也才挂对会话）。
+          const published = await piSessionHost.publish(subject, async (message) => {
+            // turn 回调：跑一次 pi（真子进程/真模型），把文本交回宿主落盘。
+            const piResult = await piEngine.runAttempt(
+              engineCtx,
+              { ...options, prompt: textOfUserMessage(message) },
+              'resume',
+            )
+            store.recordPiResult('resume', piResult, null)
+            const text =
+              typeof piResult.piText === 'string'
+                ? piResult.piText
+                : typeof piResult.text === 'string'
+                  ? piResult.text
+                  : ''
+            // endo-pi.sh / 真机断言读的就是这几个字段（保持字段名与语义不变）
+            store.evidence.sessionId = sessionId
+            store.evidence.assistantMessageAppended = true
+            store.evidence.committedText = text
+            store.evidence.commitError = null
+            // provider/model 如实交给宿主写进 assistant/message.source（pi 钉死的路由值）
+            const effectiveModel =
+              typeof piResult.effectiveModel === 'string' ? piResult.effectiveModel : ''
+            const slash = effectiveModel.indexOf('/')
+            return {
+              text,
+              piResult,
+              provider: typeof piResult.provider === 'string' ? piResult.provider : 'pi',
+              model:
+                slash > 0 && effectiveModel.slice(0, slash) === piResult.provider
+                  ? effectiveModel.slice(slash + 1)
+                  : effectiveModel === ''
+                    ? 'pi'
+                    : effectiveModel,
+            }
+          })
+          // 发布失败时必须**看着失败**：交回一个没注进注册表的 Agent，
+          // 上游紧接着 `ctx.agents.get(agent.id)` 就会拿不到（session/not-found 或更坏的 TypeError）。
+          // 只在「本进程确实有 sessions 服务」时算硬错（极简组装 / 单测没有它时保持原行为）。
+          if (published === null && piSessionHost.hasSessionsService()) {
+            store.evidence.piPublishError = piSessionHost.snapshot().lastError
+            store.write('pi-publish-failed')
+            throw new Error(
+              kind === 'createAgent'
+                ? `pi engine: 会话 "${sessionId}" 建好了但 Agent 没能注册进 ctx.agents（不交付半成品）`
+                : `pi engine: 无法重新载入会话 "${sessionId}"（持久化里没有它的 pi 会话日志）`,
+            )
+          }
+          // 包装成调用方期望的 `{agent}` 结构（AgentLoop 的 createAgent 同样返回 handle）
+          result.agent = subject
         }
         store.write('pi-commit')
       },
     })
     router[STATE] = state
     router[STATE] = state
-    state.installed = { nativeTarget, router, echoEngine, piEngine }
+    state.installed = { nativeTarget, router, echoEngine, piEngine, piSessionHost }
     // 字段接管：把路由器写回真实 factory 槽位。
     agents.factory = { target: router }
     const slotAfter = agents.factory?.target
@@ -1271,6 +1301,8 @@ export function apply(ctx, config = {}) {
         ) {
           agents.factory = { target: installed.nativeTarget }
         }
+        // 卸载 pi 会话宿主：把注册过的 Agent / 会话从各自 store 里摘掉（磁盘日志保留）。
+        installed.piSessionHost?.dispose?.().catch(() => {})
         state.installed = null
       },
       `${PLUGIN_NAME}:restore`,

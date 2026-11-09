@@ -1,0 +1,25 @@
+# 注入用 patch：把 dsh-engine-switch 外挂插进真实 DSH **web** profile 的装配树，
+# 并把独立引擎选择器设为 pi（engine: 'pi'，走桌面端同一个入口）。
+#
+# 用法（endo-session.sh 自动执行）：
+#   DSH_HOME=<workspace>/.recon/dsh-session-home \
+#     node <dsh>/lib/bin.js testweb --patch <this-patch> --port <port> --no-open
+#
+# 关键点：
+#   · `insert.name` 的相对路径是**相对补丁文件目录**解析的，故 ./index.js 指本目录插件。
+#   · engine: 'pi'（**不是** forceEngine）—— 桌面端 ~/.dsh/profiles/desktop/cordis.patch.yml
+#     里配的就是这个字段，本脚本复现的是同一个判定入口（config.engine）。
+#   · pi.agentDir 指向工作区内已播种的 .pi-agent（pi 子进程缺它会因写锁文件 EPERM 直接崩）。
+- insert:
+    - id: engine-switch-web-pi
+      name: ./index.js
+      config:
+        evidencePath: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-session-inject/web-session-evidence.json
+        engine: pi
+        pi:
+          agentDir: /Users/ivywu/Documents/deepseek-harness/default-workspace/dsh-engine-switch/.pi-agent
+          timeoutMs: 60000
+          provider: magpie
+          model: auto/deepseek-v4.1-flash
+          cliPath: /Users/ivywu/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+          cwd: /Users/ivywu/Documents/deepseek-harness/default-workspace/.recon/dsh-session-inject
