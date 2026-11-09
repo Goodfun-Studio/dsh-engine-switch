@@ -79,7 +79,7 @@ plugin_manager install_bundle
 
 | 包 | 声明 | 谁来提供 |
 | --- | --- | --- |
-| `@deepseek-ai/*`（schemastery、cordis、dsh-agent、dsh-llm、dsh-session、dsh-agent-loop） | `peerDependencies` | 宿主 DSH profile（profile 的 `pnpm-workspace.yaml` 设了 `autoInstallPeers: false`，不随插件安装） |
+| `@deepseek-ai/*`（schemastery、cordis、dsh-agent、dsh-llm、dsh-session、dsh-agent-loop、dsh-scope） | `peerDependencies` | 宿主 DSH profile（profile 的 `pnpm-workspace.yaml` 设了 `autoInstallPeers: false`，不随插件安装） |
 | `@botiverse/oar` | `dependencies`（`^0.95.0`） | 插件自身，正常安装 |
 
 `@deepseek-ai/*` 的版本区间统一是：
@@ -268,7 +268,7 @@ bash client-ui.sh
 bash engine-selector.sh
 ```
 
-期望输出：`SUMMARY: 82 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+期望输出：`SUMMARY: 81 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
 
 ### 3. smoke.sh（冒烟测试，27 条）
 
@@ -372,7 +372,7 @@ L8 新增的 10 条断言（真机面）：`MODEL_CATALOG_PI_GROUP`（真机 `se
 bash pi-models-sync.sh
 ```
 
-期望输出：`SUMMARY: 81 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
+期望输出：`SUMMARY: 82 HIT / 0 MISS`、`RESULT: PASS`、退出码 0。
 
 断言分组：`PI_SOURCE`（目录来源：OAR 优先 / `models.json` 兜底 / disabled 剔除 / id 不改写 / TTL + invalidate）、
 `PI_ADAPTER`（DTO 投影过宿主的 `INVALID_CATALOG` / `UNKNOWN_MODEL` / `UNSUPPORTED_REASONING_EFFORT` /
@@ -443,6 +443,33 @@ bash rehearse-rollback.sh                  # 回滚彩排（20 条，含 DESKTOP
 17. **`endo-pi.sh` 有一条天然会抖的断言**：它要求真模型逐字复述 20 字符随机 token，
     模型偶发少输出末尾一个字符就会 FAIL（本轮四次运行中失败一次，重跑即绿）。
     失败时证据 JSON 里的 `piTextLength` / `piTextDeltas` 可用于区分「模型少说」还是「适配器丢分片」
+
+## 常见问题与排查（FAQ）
+
+### 1. DSH 桌面端重启失败 / `desktop welcome: Web authentication failed`
+
+- **现象**：高频调试、频繁重启 DSH 桌面端后，启动时卡在欢迎页或提示 `desktop welcome: Web authentication failed`，主进程退回 welcome 流程。
+- **根因**：DSH 每次在随机本地端口启动时，均会向 `127.0.0.1` 写入 30 天有效期的 `dsh-auth-...` Cookie。高频重启导致 Chromium Cookie 数据库（`~/Library/Application Support/@deepseek-ai/dsh-desktop/Cookies`）累积大量旧 Cookie（例如 70+ 条、总长超过 16KB）。Electron 主进程在握手本地 Host 时带上全部 Cookie，导致请求头尺寸击穿 Node.js 默认的 16KB 上限（HTTP 431 `Request Header Fields Too Large`），连接被拒。
+- **排查与恢复**：
+  1. 彻底退出桌面端（`Cmd+Q`，或 `pkill -9 -f "DeepSeek Harness"`）；
+  2. 备份并清理 Cookie 数据库与残留单例锁：
+     ```bash
+     mv "$HOME/Library/Application Support/@deepseek-ai/dsh-desktop/Cookies" "$HOME/Library/Application Support/@deepseek-ai/dsh-desktop/Cookies.bak"
+     rm -f "$HOME/Library/Application Support/@deepseek-ai/dsh-desktop/SingletonLock" "$HOME/Library/Application Support/@deepseek-ai/dsh-desktop/SingletonSocket"
+     ```
+  3. 重新打开桌面端（`open -a "DeepSeek Harness"`）即可正常进入。
+
+### 2. 写入引擎选择器报错 `namespace-unavailable (engine-switch)`
+
+- **现象**：在桌面端 UI 点击「⚡ 引擎」Chip 切换或输入框执行 `/engine <val>` 时，面板提示 `写入失败：namespace-unavailable (engine-switch)`。
+- **根因**：插件的 settings 命名空间未就绪。通常发生在刚修改了 patch 配置但未重启桌面端，或 profile 的 `cordis.patch.yml` 中未正确加载 `engine-switch`。
+- **解决**：确认 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `insert:` 节点下包含 `engine-switch`，退出并重新启动桌面端加载最新 bundle 即可。
+
+### 3. 主会话出现两个「⚡ 引擎」Chip
+
+- **现象**：在新会话页面中，既在顶部预设旁看到 Chip，又在输入框卡片正上方看到孤立浮动的 Chip。
+- **根因与状态**：旧版曾同时向 `conversation.hero.options` 与 `conversation.input.dock` 两处插槽挂载。L9 已彻底移除 `conversation.input.dock` 注册，单页仅保留一枚。
+- **解决**：若界面仍显示两枚，说明桌面端加载的是旧版客户端 bundle 缓存，重启桌面端或在窗口中执行刷新即可更新为单枚 Chip。
 
 ---
 
