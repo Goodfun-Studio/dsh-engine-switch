@@ -1374,6 +1374,9 @@ export function apply(ctx, config = {}) {
     get piEngine() {
       return state.installed?.piEngine
     },
+    get nativeSessionStore() {
+      return state.installed?.piNativeSessions
+    },
   }
 
   /**
@@ -1551,7 +1554,14 @@ export function apply(ctx, config = {}) {
     })
     router[STATE] = state
     router[STATE] = state
-    state.installed = { nativeTarget, router, echoEngine, piEngine, piSessionHost }
+    state.installed = {
+      nativeTarget,
+      router,
+      echoEngine,
+      piEngine,
+      piSessionHost,
+      piNativeSessions,
+    }
     // 字段接管：把路由器写回真实 factory 槽位。
     agents.factory = { target: router }
     const slotAfter = agents.factory?.target
