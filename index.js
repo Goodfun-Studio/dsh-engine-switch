@@ -94,16 +94,17 @@ import {
   showResultText,
 } from './engine-command.mjs'
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   createPiSessionHost,
   createStandInSubject,
   sessionIdOfOptions,
-  textOfUserMessage,
 } from './pi-session.mjs'
+import { createPiNativeSessionStore } from './pi-context.mjs'
 import {
   createPiCatalogBinding,
   createPiCatalogSource,
+  defaultPiAgentDir,
   PI_DEFAULT_MODEL,
   PI_DEFAULT_PROVIDER,
   PI_PROVIDER_ID,
@@ -724,6 +725,18 @@ export function createEvidenceStore(config = {}) {
     modelCatalogModels: 0,
     /** 目录列不出来时的原因（OAR 不可用 / 读盘失败 …）。 */
     modelCatalogError: null,
+    /** 最近一次模型 face 结果（兼容既有证据读取方）。 */
+    modelAttempt: null,
+    /** 有界 attempts 历史：后面的正常轮次不会抹掉此前的回退事实。 */
+    modelAttempts: [],
+    /** 最近一次 Pi 上下文续接结论（兼容既有验收口径）。 */
+    piContinuityAttempt: null,
+    /** 进程级累计续接信号；fallbackCounts 是持久化的累计事实，不随 latest 覆盖。 */
+    piContinuity: {
+      attempts: 0,
+      modeCounts: { fresh: 0, resume: 0, bootstrap: 0 },
+      fallbackCounts: {},
+    },
     /** 模型面自己的失败原因（注册被拒 / 注销失败）；空串/缺失 = 无错。 */
     modelSyncError: null,
     takeoverPhase: 'not-installed',
@@ -890,7 +903,7 @@ export function createEvidenceStore(config = {}) {
      */
     recordModelAttempt(kind, result) {
       if (result === null || typeof result !== 'object') return evidence
-      evidence.modelAttempt = {
+      const attempt = {
         kind,
         selection: result.selection ?? null,
         requested: result.modelRequested ?? null,
@@ -902,7 +915,57 @@ export function createEvidenceStore(config = {}) {
         effectiveModel: result.effectiveModel ?? null,
         provider: result.provider ?? null,
         mismatch: result.modelMismatch ?? null,
+        cwd: result.cwd ?? null,
+        nativePiSessionId: result.nativePiSessionId ?? null,
+        nativeSessionRequested: result.nativeSessionRequested ?? null,
+        nativeSessionResumed: result.nativeSessionResumed === true,
+        nativeSessionFallback: result.nativeSessionFallback ?? null,
+        nativeSessionFallbackError: result.nativeSessionFallbackError ?? null,
+        nativeSessionStorePath: result.nativeSessionStorePath ?? null,
+        nativeSessionPersisted: result.nativeSessionPersisted === true,
+        nativeSessionStoreError: result.nativeSessionStoreError ?? null,
+        historyMessages: result.historyMessages ?? 0,
+        bootstrapInjected: result.bootstrapInjected === true,
+        bootstrapMessageCount: result.bootstrapMessageCount ?? 0,
+        bootstrapChars: result.bootstrapChars ?? 0,
+        piPromptLength: typeof result.piPrompt === 'string' ? result.piPrompt.length : 0,
         error: typeof result.error === 'string' && result.error !== '' ? result.error : null,
+      }
+      evidence.modelAttempt = attempt
+      evidence.modelAttempts.push(attempt)
+      if (evidence.modelAttempts.length > 80) evidence.modelAttempts.shift()
+
+      const mode =
+        attempt.nativeSessionFallback !== null
+          ? 'bootstrap'
+          : attempt.nativeSessionResumed
+            ? 'resume'
+            : attempt.bootstrapInjected
+              ? 'bootstrap'
+              : 'fresh'
+      const continuityAttempt = {
+        kind,
+        piSessionId: attempt.nativePiSessionId,
+        cwd: attempt.cwd,
+        mode,
+        reason:
+          attempt.nativeSessionFallback ??
+          (attempt.nativeSessionRequested === null ? 'new-session' : 'binding'),
+        resume: attempt.nativeSessionRequested,
+        fallbackReason: attempt.nativeSessionFallbackError,
+        bootstrap: {
+          injected: attempt.bootstrapInjected,
+          messageCount: attempt.bootstrapMessageCount,
+          chars: attempt.bootstrapChars,
+        },
+      }
+      evidence.piContinuityAttempt = continuityAttempt
+      evidence.piContinuity.attempts += 1
+      evidence.piContinuity.modeCounts[mode] += 1
+      if (attempt.nativeSessionFallback !== null) {
+        const reason = attempt.nativeSessionFallback
+        evidence.piContinuity.fallbackCounts[reason] =
+          (evidence.piContinuity.fallbackCounts[reason] ?? 0) + 1
       }
       write('pi-models')
       return evidence
@@ -1340,6 +1403,15 @@ export function apply(ctx, config = {}) {
         store.recordPiSession(event, detail)
       },
     })
+    // Pi 原生 session id 的持久绑定。放在 Pi agentDir 下的插件私有子目录：
+    // 文件只存 id/cwd/model，不复制对话正文；每个 DSH 会话一个原子 JSON 文件。
+    const piNativeSessions = createPiNativeSessionStore({
+      dir: join(
+        piConfig.agentDir ?? defaultPiAgentDir(),
+        'dsh-engine-switch',
+        'native-sessions',
+      ),
+    })
     // 真引擎：pi 引擎只在被 marker 命中时才 spawn 子进程（懒启动，见 pi-engine.mjs）。
     const piEngine = createOarEngine({
       agentDir: piConfig.agentDir,
@@ -1352,6 +1424,7 @@ export function apply(ctx, config = {}) {
       cwd: piConfig.cwd,
       piModulePath: piConfig.piModulePath,
       sessionHost: piSessionHost,
+      nativeSessionStore: piNativeSessions,
       /**
        * 模型面接线（L8）：选区 → 本次 attempt 真正交给 pi 的选择子。
        *
@@ -1406,11 +1479,21 @@ export function apply(ctx, config = {}) {
           // 发布：把替身注册进 ctx.agents（enter + announce），并装上
           // followup/whenIdle/status/inbox/model 的 Agent 表面契约。
           // 会话本身已经在引擎的 runAttempt 里 attach 完毕（那里才有身份可绑、帧也才挂对会话）。
-          const published = await piSessionHost.publish(subject, async (message) => {
+          const published = await piSessionHost.publish(subject, async (message, promptText, context = {}) => {
             // turn 回调：跑一次 pi（真子进程/真模型），把文本交回宿主落盘。
+            const turnOptions = {
+              ...options,
+              prompt: promptText,
+              // pi-session 已在 append 当前 user/message **之前**取好历史；这里原样交给
+              // 引擎，只有旧会话/失效 resume 才会把它拼成一次性的文本 Bootstrap。
+              piHistory: Array.isArray(context.history) ? context.history : [],
+            }
+            if (typeof context.cwd === 'string' && context.cwd !== '') {
+              turnOptions.meta = { ...options?.meta, cwd: context.cwd }
+            }
             const piResult = await piEngine.runAttempt(
               engineCtx,
-              { ...options, prompt: textOfUserMessage(message) },
+              turnOptions,
               'resume',
             )
             store.recordPiResult('resume', piResult, null)

@@ -32,6 +32,13 @@
 #   NEG_NATIVE_PROVIDER_ABSENT  证据里 engine=native / registered=false / 从没列过目录
 #   NEG_NATIVE_NO_PI_PROCESS    native 宿主日志里没有 pi 会话（零替身、零 pi 子进程）
 #
+# L10 新增（Pi 多轮上下文）：
+#   FIRST_NATIVE_BOUND        首轮 attempt 绑定并持久化 Pi native session id
+#   SAME_PROCESS_RECALLS_FIRST 不重启宿主，第二轮就能复述第一轮 token
+#   THIRD_NATIVE_RESUMED      重启后的第三轮 resume 同一个 native id
+#   THIRD_TURN_RECALLS_FIRST  第一轮 token 在重启后的真实 Pi 回答里仍被复述
+#   PI_CWD_STABLE             每轮 Pi cwd = DSH 会话 workspace cwd
+#
 # 否定面（不在这台机器上跑）：Native 引擎的正/负向断言由确定性套件
 # session-lifecycle.mjs 的 NEG_NATIVE 组覆盖（无网、无模型、可复跑）。
 #
@@ -39,8 +46,15 @@
 # 退出码：MISS > 0 → 非 0；全部 HIT（MISS == 0）→ 0。
 set -uo pipefail
 
-ROOT="${DSH_WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
-SWITCH="$ROOT/dsh-engine-switch"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="${DSH_WORKSPACE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+if [ -n "${DSH_SWITCH:-}" ]; then
+  SWITCH="$DSH_SWITCH"
+elif [ -f "$SCRIPT_DIR/package.json" ]; then
+  SWITCH="$SCRIPT_DIR"
+else
+  SWITCH="$ROOT/dsh-engine-switch"
+fi
 CLI="$ROOT/.recon/dsh-src/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
 UPSTREAM_AI="$ROOT/.recon/dsh-src/dsh/node_modules/@deepseek-ai"
 INJECT_DIR="$ROOT/.recon/dsh-session-inject"
@@ -50,16 +64,20 @@ PROFILE_NAME="testweb"
 PROFILE_DIR="$DSH_HOME/profiles/$PROFILE_NAME"
 PATCH_TEMPLATE="$SWITCH/real-pi-web-patch.yml"
 PATCH="$INJECT_DIR/web-pi-patch.yml"
-PI_AGENT_DIR="${PI_AGENT_DIR:-$SWITCH/.pi-agent}"
+PI_AGENT_SOURCE="${PI_AGENT_SOURCE:-$ROOT/dsh-engine-switch/.pi-agent}"
+PI_AGENT_DIR="${PI_AGENT_DIR:-$INJECT_DIR/pi-agent}"
 PI_CLI_PATH="${PI_CLI_PATH:-$HOME/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js}"
 EVIDENCE="$INJECT_DIR/web-session-evidence.json"
 LOG="$INJECT_DIR/endo-session-host.log"
+CONT_BIND_DIR="$PI_AGENT_DIR/dsh-engine-switch/native-sessions"
+CONT_ASK="${CONT_ASK:-What verification token did I give you in the previous message? Reply with the token only.}"
 PORT="${PORT:-0}"   # 0 = 让宿主自己挑空闲端口（避免与残留进程抢端口）
 HOST_PID=""
 
 HIT=0; MISS=0
 hit(){  printf '[HIT]  %s\n' "$1"; HIT=$((HIT+1)); }
 miss(){ printf '[MISS] %s\n' "$1"; MISS=$((MISS+1)); }
+RECALL_TOKEN="${RECALL_TOKEN:-L10-${RANDOM}${RANDOM}-$(date +%H%M%S)}"
 
 cleanup(){
   if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
@@ -82,6 +100,15 @@ echo
 [ -f "$SWITCH/index.js" ] || { echo "FATAL: plugin entry not found"; exit 2; }
 
 mkdir -p "$INJECT_DIR"
+mkdir -p "$PI_AGENT_DIR"
+# 复用主工作区已经播种的 Pi auth/models，但 sessions 和 native bindings 仍落在测试隔离目录。
+for _name in auth.json models-store.json models.json settings.json trust.json extensions skills npm; do
+  _src="$PI_AGENT_SOURCE/$_name"
+  _dst="$PI_AGENT_DIR/$_name"
+  if [ -e "$_src" ] && [ ! -e "$_dst" ]; then
+    ln -sfn "$_src" "$_dst"
+  fi
+done
 sed -e "s#\${DSH_INJECT_DIR}#$INJECT_DIR#g" \
     -e "s#\${PI_AGENT_DIR}#$PI_AGENT_DIR#g" \
     -e "s#\${PI_CLI_PATH}#$PI_CLI_PATH#g" \
@@ -121,16 +148,77 @@ jsonq(){
   " "$1" "$2" 2>/dev/null
 }
 
+# 绑定/原生会话文件的定位（L10）。绑定文件按 DSH session id 一一对应。
+bind_pi_id(){
+  [ -f "$CONT_BIND_FILE" ] || { echo ""; return 0; }
+  jsonq "$CONT_BIND_FILE" "\$ && \$.dshSessionId==='$SESSION_ID' && \$.piSessionId"
+}
+pi_session_file(){
+  find "$PI_AGENT_DIR/sessions" -name "*${1}.jsonl" 2>/dev/null | head -1
+}
+wait_turns(){
+  local want="$1"
+  for _ in $(seq 1 120); do
+    if [ -n "${SESSION_LOG_DIR:-}" ] && zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null | node -e "
+let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+  for(const line of s.split('\n').filter(Boolean)){try{const j=JSON.parse(line);
+    if(j.type==='turn/end'&&j.data?.turn===Number(process.argv[1])) process.exit(0)
+  }catch{}}
+  process.exit(1)
+})" "$want"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+turn_count(){
+  zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null | node -e "
+let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let n=0;
+  for(const line of s.split('\n').filter(Boolean)){try{const j=JSON.parse(line);if(j.type==='turn/start')n++}catch{}}
+  process.stdout.write(String(n));
+})"
+}
+assistant_for_turn(){
+  local want="$1"
+  zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null | node -e "
+let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let out='';
+  for(const line of s.split('\n').filter(Boolean)){try{const j=JSON.parse(line);
+    if(j.type==='assistant/message'&&j.data?.turn===Number(process.argv[1])){
+      for(const b of (j.data?.message?.content??[])) if(b.type==='text') out+=b.text
+    }
+  }catch{}}
+  process.stdout.write(out);
+})" "$want"
+}
+
 # ---------- 0) 真实 ~/.dsh 只读指纹（前） ----------
-fp_dir(){
-  local d="$1"
-  if [ -d "$d" ]; then
-    ( cd "$d" && find . -type f -size -262144c -exec shasum -a 256 {} + 2>/dev/null | LC_ALL=C sort )
+fp_dsh_scope(){
+  for sub in sessions storages profiles; do
+    printf '## %s\n' "$sub"
+    if [ -d "$REAL_DSH/$sub" ]; then
+      ( cd "$REAL_DSH/$sub" && find . -type f -exec shasum -a 256 {} + 2>/dev/null | LC_ALL=C sort )
+    else
+      printf '__ABSENT__\n'
+    fi
+  done | shasum -a 256
+}
+fp_dsh_ambient(){
+  if [ -d "$REAL_DSH" ]; then
+    (
+      cd "$REAL_DSH"
+      find . -type f \
+        ! -path './sessions/*' \
+        ! -path './storages/*' \
+        ! -path './profiles/*' \
+        -exec shasum -a 256 {} + 2>/dev/null | LC_ALL=C sort
+    ) | shasum -a 256
   else
-    echo "__ABSENT__"
+    printf '__ABSENT__\n' | shasum -a 256
   fi
 }
-REAL_BEFORE="$(fp_dir "$REAL_DSH" 2>/dev/null | shasum -a 256)"
+REAL_SCOPE_BEFORE="$(fp_dsh_scope 2>/dev/null)"
+REAL_AMBIENT_BEFORE="$(fp_dsh_ambient 2>/dev/null)"
 
 # ---------- 1) 一次性 profile ----------
 echo "--- [1] create/refresh one-shot profile '$PROFILE_NAME' (from shipped 'web') ---"
@@ -221,6 +309,7 @@ echo
 
 CREATE_OK="$(echo "$CREATE_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.ok===true))}catch(e){process.stdout.write('false')}})")"
 SESSION_ID="$(echo "$CREATE_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.value?.sessionId??''))}catch(e){}})")"
+CONT_BIND_FILE="$CONT_BIND_DIR/$(node -e "process.stdout.write(encodeURIComponent(process.argv[1]).replaceAll('%','_'))" "$SESSION_ID").json"
 CREATE_ERR_CODE="$(echo "$CREATE_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.error?.code??''))}catch(e){}})")"
 CREATE_ERR_MSG="$(echo "$CREATE_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.error?.message??''))}catch(e){}})")"
 
@@ -319,7 +408,7 @@ STATE_ERR="$(echo "$STATE_RES" | node -e "let s='';process.stdin.on('data',d=>s+
 
 echo
 echo "--- [5] session/prompt（首轮真实 pi 调用）---"
-TASK_TEXT="${TASK:-reply with exactly: L7_SESSION_OK}"
+TASK_TEXT="${TASK:-The verification token is ${RECALL_TOKEN}. Remember it for the next message. Reply with exactly: L7_SESSION_OK}"
 PROMPT_RES="$(rpc session/prompt "{\"request\":{\"sessionId\":\"$SESSION_ID\",\"mode\":\"queue\",\"requestId\":\"l7-first-turn\",\"content\":[{\"type\":\"text\",\"text\":\"$TASK_TEXT\"}]}}")"
 echo "session/prompt → $(echo "$PROMPT_RES" | head -c 400)"
 PROMPT_OK="$(echo "$PROMPT_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.ok===true))}catch(e){process.stdout.write('false')}})")"
@@ -398,6 +487,11 @@ JMSYNC="$(jsonq "$EVIDENCE" '$ && $.modelSync && $.modelSync.registered')"
 JMPICK="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.piModel')"
 JMSEL="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.modelSource')"
 JMEFF="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.effectiveModel')"
+JNAT1="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativePiSessionId')"
+JRES1="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionResumed')"
+JBOOT1="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.bootstrapInjected')"
+JNPERSIST1="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionPersisted')"
+JCWD1="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.cwd')"
 echo "evidence.modelCatalogSource='$JMSRC' modelSync.registered='$JMSYNC' modelAttempt.piModel='$JMPICK'"
 [ "$JMSRC" = "oar" ] && hit "MODEL_CATALOG_SOURCE  (目录来自 OAR pi runtime —— 与真实会话同一条模型栈)" || miss "MODEL_CATALOG_SOURCE  (modelCatalogSource='$JMSRC')"
 [ "$JMSYNC" = "true" ] && hit "MODEL_SYNC_REGISTERED  (engine=pi 时 pi provider 注册在宿主 llm 注册表里)" || miss "MODEL_SYNC_REGISTERED  (modelSync.registered='$JMSYNC')"
@@ -421,10 +515,74 @@ echo "durable assistant source: '$LOG_SRC'  (selected '$SEL_ONE')"
   || miss "MODEL_SOURCE_DURABLE  (durable source='$LOG_SRC' expected='$SEL_ONE')"
 [ "$JSESS" = "true" ] && hit "PI_SESSION_DURABLE  (该会话 durable=true —— 有持久化句柄)" || miss "PI_SESSION_DURABLE  (durable='$JSESS')"
 [ "$JSID" = "$SESSION_ID" ] && hit "EVIDENCE_SESSION_ID  (证据里的 sessionId 与 RPC 返回一致)" || miss "EVIDENCE_SESSION_ID  (证据 sessionId='$JSID' vs rpc='$SESSION_ID')"
+if [ -n "$JNAT1" ] && [ "$JNPERSIST1" = "true" ] && [ "$JRES1" = "true" ]; then
+  hit "FIRST_NATIVE_BOUND  (Pi native id='$JNAT1' 已持久化，首轮用户消息通过 resume 进入同一会话)"
+else
+  miss "FIRST_NATIVE_BOUND  (nativePiSessionId='$JNAT1' persisted='$JNPERSIST1' resumed='$JRES1')"
+fi
+if [ -n "$JCWD1" ] && [ "$JCWD1" = "$WS_PATH" ]; then
+  hit "PI_CWD_STABLE  (首轮 Pi cwd='$JCWD1' = DSH workspace cwd；不回退 desktop profile)"
+else
+  miss "PI_CWD_STABLE  (首轮 Pi cwd='$JCWD1' expected='$WS_PATH')"
+fi
 
-# ---------- 8) 重启宿主后：旧会话还能打开并接着聊（桌面端重启后的第二条路径） ----------
+# ---------- 8) 不重启宿主：同一会话立刻发第二轮（用户实际遇到的路径） ----------
 echo
-echo "--- [8] restart host, then re-prompt the SAME session (cold resume) ---"
+echo "--- [8] same-process second turn (no host restart) ---"
+TASK2_TEXT="${TASK2:-What verification token did I give you in the previous message? Reply with the token only.}"
+SAME_RES="$(rpc session/prompt "{\"request\":{\"sessionId\":\"$SESSION_ID\",\"mode\":\"queue\",\"requestId\":\"l10-same-process-second-turn\",\"content\":[{\"type\":\"text\",\"text\":\"$TASK2_TEXT\"}]}}")"
+echo "session/prompt (same process) → $(echo "$SAME_RES" | head -c 400)"
+SAME_OK="$(echo "$SAME_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.ok===true))}catch(e){process.stdout.write('false')}})")"
+SAME_ERR="$(echo "$SAME_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.error?.code??'')+':'+String(j?.result?.error?.message??''))}catch(e){}})")"
+if [ "$SAME_OK" = "true" ]; then
+  hit "SAME_PROCESS_PROMPT_ACCEPTED  (不重启宿主，第二轮 session/prompt 被接受)"
+else
+  miss "SAME_PROCESS_PROMPT_ACCEPTED  (同进程第二轮失败: $SAME_ERR)"
+fi
+
+for _ in $(seq 1 120); do
+  if zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null | node -e "
+let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+  for(const line of s.split('\n').filter(Boolean)){try{const j=JSON.parse(line);
+    if(j.type==='turn/end'&&j.data?.turn===2) process.exit(0)
+  }catch{}}
+  process.exit(1)
+})"; then
+    break
+  fi
+  sleep 1
+done
+LOG_JSON_SAME="$(zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null)"
+TURNS_SAME="$(echo "$LOG_JSON_SAME" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let n=0;for(const l of s.split('\n').filter(Boolean)){try{const j=JSON.parse(l);if(j.type==='turn/start')n++}catch(e){}}process.stdout.write(String(n))})")"
+SECOND_ASSISTANT="$(echo "$LOG_JSON_SAME" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let t='';for(const l of s.split('\n').filter(Boolean)){try{const j=JSON.parse(l);if(j.type==='assistant/message'&&j.data?.turn===2)for(const b of (j.data?.message?.content??[]))if(b.type==='text')t+=b.text}catch(e){}}process.stdout.write(t)})")"
+echo "durable turns after same-process turn: $TURNS_SAME"
+echo "same-process second-turn assistant: $(echo "$SECOND_ASSISTANT" | head -c 160)"
+[ "$TURNS_SAME" = "2" ] && hit "SAME_PROCESS_SECOND_TURN_DURABLE  (同进程第二轮完整落盘，turn=2)" || miss "SAME_PROCESS_SECOND_TURN_DURABLE  (历史里 turn 数=$TURNS_SAME)"
+case "$SECOND_ASSISTANT" in
+  *"$RECALL_TOKEN"*) hit "SAME_PROCESS_RECALLS_FIRST  (同进程第二轮真实 Pi 回答复述了第一轮 token '$RECALL_TOKEN')" ;;
+  *) miss "SAME_PROCESS_RECALLS_FIRST  (同进程第二轮没有复述 token '$RECALL_TOKEN': '$(echo "$SECOND_ASSISTANT" | head -c 200)')" ;;
+esac
+
+JNAT_SAME="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativePiSessionId')"
+JRESREQ_SAME="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionRequested')"
+JRES_SAME="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionResumed')"
+JBOOT_SAME="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.bootstrapInjected')"
+JHIST_SAME="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.historyMessages')"
+echo "same-process native context: id='$JNAT_SAME' requested='$JRESREQ_SAME' resumed='$JRES_SAME' bootstrap='$JBOOT_SAME' historyMessages='$JHIST_SAME'"
+if [ -n "$JNAT1" ] && [ "$JNAT_SAME" = "$JNAT1" ] && [ "$JRESREQ_SAME" = "$JNAT1" ] && [ "$JRES_SAME" = "true" ]; then
+  hit "SAME_PROCESS_NATIVE_RESUMED  (同进程第二轮 resume 同一个 Pi native id '$JNAT1')"
+else
+  miss "SAME_PROCESS_NATIVE_RESUMED  (first='$JNAT1' same='$JNAT_SAME' requested='$JRESREQ_SAME' resumed='$JRES_SAME')"
+fi
+if [ "$JBOOT_SAME" = "false" ] && [ -n "$JHIST_SAME" ] && [ "$JHIST_SAME" -ge 2 ] 2>/dev/null; then
+  hit "SAME_PROCESS_USES_NATIVE_HISTORY  (resume 成功时未重复注入 Bootstrap；DSH 历史消息数=$JHIST_SAME)"
+else
+  miss "SAME_PROCESS_USES_NATIVE_HISTORY  (bootstrap='$JBOOT_SAME' historyMessages='$JHIST_SAME')"
+fi
+
+# ---------- 9) 重启宿主后：旧会话还能打开并接着聊（桌面端重启后的第二条路径） ----------
+echo
+echo "--- [9] restart host, then send the third turn to the SAME session (cold resume) ---"
 kill "$HOST_PID" 2>/dev/null
 for _ in $(seq 1 20); do kill -0 "$HOST_PID" 2>/dev/null || break; sleep 0.5; done
 kill -9 "$HOST_PID" 2>/dev/null
@@ -434,8 +592,8 @@ sleep 1
 PORT=0
 boot_host || exit 2
 
-TASK2_TEXT="${TASK2:-reply with exactly: L7_RESUME_OK}"
-RESUME_RES="$(rpc session/prompt "{\"request\":{\"sessionId\":\"$SESSION_ID\",\"mode\":\"queue\",\"requestId\":\"l7-second-turn\",\"content\":[{\"type\":\"text\",\"text\":\"$TASK2_TEXT\"}]}}")"
+TASK3_TEXT="${TASK3:-After the restart, what verification token did I give you in the first message? Reply with the token only.}"
+RESUME_RES="$(rpc session/prompt "{\"request\":{\"sessionId\":\"$SESSION_ID\",\"mode\":\"queue\",\"requestId\":\"l10-third-turn-after-restart\",\"content\":[{\"type\":\"text\",\"text\":\"$TASK3_TEXT\"}]}}")"
 echo "session/prompt (after restart) → $(echo "$RESUME_RES" | head -c 400)"
 RESUME_OK="$(echo "$RESUME_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.ok===true))}catch(e){process.stdout.write('false')}})")"
 RESUME_ERR="$(echo "$RESUME_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.error?.code??'')+':'+String(j?.result?.error?.message??''))}catch(e){}})")"
@@ -445,19 +603,130 @@ else
   miss "RESUME_AFTER_RESTART  (重启后 session/prompt 失败: $RESUME_ERR)"
 fi
 
-# 等第二轮落盘（真实模型调用；最多 90s）
-for _ in $(seq 1 90); do
-  if zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null | grep -q '"turn":2'; then
-    break
-  fi
-  sleep 1
-done
-LOG_JSON2="$(zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null | head -80)"
-TURNS2="$(echo "$LOG_JSON2" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let n=0;for(const l of s.split('\n').filter(Boolean)){try{const j=JSON.parse(l);if(j.type==='turn/start')n++}catch(e){}}process.stdout.write(String(n))})")"
+# 等第三轮完整落盘（必须等 turn/end，不能只看到 turn/start 就提前发下一轮）
+wait_turns 3 || true
+LOG_JSON2="$(zstdcat "$SESSION_LOG_DIR/session.v4.jsonl.zstd" 2>/dev/null)"
+TURNS3="$(echo "$LOG_JSON2" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let n=0;for(const l of s.split('\n').filter(Boolean)){try{const j=JSON.parse(l);if(j.type==='turn/start')n++}catch(e){}}process.stdout.write(String(n))})")"
 HISTORY_KEPT="$(echo "$LOG_JSON2" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let t='';for(const l of s.split('\n').filter(Boolean)){try{const j=JSON.parse(l);if(j.type==='user/message')for(const b of (j.data?.content??[]))if(b.type==='text')t+=b.text}catch(e){}}process.stdout.write(t.includes('L7_SESSION_OK')?'kept':'lost')})")"
-echo "durable turns after restart: $TURNS2   first-turn history: $HISTORY_KEPT"
-[ "$TURNS2" = "2" ] && hit "SECOND_TURN_DURABLE  (重启后第二轮也写进了 durable 历史，turn 号续到 2)" || miss "SECOND_TURN_DURABLE  (历史里 turn 数=$TURNS2)"
+THIRD_ASSISTANT="$(echo "$LOG_JSON2" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let t='';for(const l of s.split('\n').filter(Boolean)){try{const j=JSON.parse(l);if(j.type==='assistant/message'&&j.data?.turn===3)for(const b of (j.data?.message?.content??[]))if(b.type==='text')t+=b.text}catch(e){}}process.stdout.write(t)})")"
+echo "durable turns after restart: $TURNS3   first-turn history: $HISTORY_KEPT"
+echo "third-turn assistant text: $(echo "$THIRD_ASSISTANT" | head -c 160)"
+[ "$TURNS3" = "3" ] && hit "THIRD_TURN_DURABLE  (重启后第三轮也写进了 durable 历史，turn 号续到 3)" || miss "THIRD_TURN_DURABLE  (历史里 turn 数=$TURNS3)"
 [ "$HISTORY_KEPT" = "kept" ] && hit "HISTORY_PRESERVED   (冷开复原了第一轮历史，没有被截断)" || miss "HISTORY_PRESERVED   (第一轮历史丢了)"
+case "$THIRD_ASSISTANT" in
+  *"$RECALL_TOKEN"*) hit "THIRD_TURN_RECALLS_FIRST  (第三轮真实 Pi 回答复述了第一轮 token '$RECALL_TOKEN')" ;;
+  *) miss "THIRD_TURN_RECALLS_FIRST  (第三轮回答没有复述 token '$RECALL_TOKEN': '$(echo "$THIRD_ASSISTANT" | head -c 200)')" ;;
+esac
+
+JNAT3="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativePiSessionId')"
+JRESREQ3="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionRequested')"
+JRES3="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionResumed')"
+JBOOT3="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.bootstrapInjected')"
+JCWD3="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.cwd')"
+JHIST3="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.historyMessages')"
+echo "restart native context: id='$JNAT3' requested='$JRESREQ3' resumed='$JRES3' bootstrap='$JBOOT3' cwd='$JCWD3' historyMessages='$JHIST3'"
+if [ -n "$JNAT1" ] && [ "$JNAT3" = "$JNAT1" ] && [ "$JRESREQ3" = "$JNAT1" ] && [ "$JRES3" = "true" ]; then
+  hit "THIRD_NATIVE_RESUMED  (宿主重启后仍找回并 resume 同一个 Pi native id '$JNAT1')"
+else
+  miss "THIRD_NATIVE_RESUMED  (first='$JNAT1' after-restart='$JNAT3' requested='$JRESREQ3' resumed='$JRES3')"
+fi
+if [ "$JBOOT3" = "false" ] && [ -n "$JHIST3" ] && [ "$JHIST3" -ge 4 ] 2>/dev/null; then
+  hit "RESUME_USES_NATIVE_HISTORY  (resume 成功时未重复注入 Bootstrap；DSH 侧历史消息数=$JHIST3)"
+else
+  miss "RESUME_USES_NATIVE_HISTORY  (bootstrap='$JBOOT3' historyMessages='$JHIST3')"
+fi
+if [ -n "$JCWD3" ] && [ "$JCWD3" = "$WS_PATH" ]; then
+  hit "PI_CWD_STABLE_AFTER_RESTART  (重启后续聊仍用 DSH workspace cwd='$JCWD3')"
+else
+  miss "PI_CWD_STABLE_AFTER_RESTART  (after restart cwd='$JCWD3' expected='$WS_PATH')"
+fi
+
+# ---------- 9.2) 旧会话没有 native 绑定：用 DSH durable 历史 Bootstrap ----------
+echo
+echo "--- [9.2] remove the native binding, fourth turn: old-session bootstrap ---"
+BOUND_BEFORE_OLD="$(bind_pi_id)"
+REMOVED_BIND_FILE="$INJECT_DIR/removed-binding-$(basename "$CONT_BIND_FILE")"
+if [ -f "$CONT_BIND_FILE" ]; then
+  mv "$CONT_BIND_FILE" "$REMOVED_BIND_FILE"
+  hit "L10_OLD_BINDING_SETUP  (移走 DSH→Pi 绑定文件，保留 DSH/原生历史以模拟旧会话)"
+else
+  miss "L10_OLD_BINDING_SETUP  (找不到当前绑定文件 '$CONT_BIND_FILE')"
+fi
+TURN4_RES="$(rpc session/prompt "{\"request\":{\"sessionId\":\"$SESSION_ID\",\"mode\":\"queue\",\"requestId\":\"l10-fourth-old-bootstrap\",\"content\":[{\"type\":\"text\",\"text\":\"$CONT_ASK\"}]}}")"
+TURN4_OK="$(echo "$TURN4_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.ok===true))}catch(e){process.stdout.write('false')}})")"
+[ "$TURN4_OK" = "true" ] && hit "L10_OLD_BOOTSTRAP_ACCEPTED  (无 native 绑定的下一轮 prompt 被接受)" || miss "L10_OLD_BOOTSTRAP_ACCEPTED  (prompt 失败: $(echo "$TURN4_RES" | head -c 220))"
+wait_turns 4 || true
+TURNS4="$(turn_count)"
+TURN4_ANSWER="$(assistant_for_turn 4)"
+JOLD_NATIVE="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativePiSessionId')"
+JOLD_REQUESTED="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionRequested')"
+JOLD_BOOT="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.bootstrapInjected')"
+JOLD_SIGNAL="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionFallback')"
+JOLD_MODE="$(jsonq "$EVIDENCE" '$ && $.piContinuityAttempt && $.piContinuityAttempt.mode')"
+JOLD_REASON="$(jsonq "$EVIDENCE" '$ && $.piContinuityAttempt && $.piContinuityAttempt.reason')"
+echo "old binding fallback: native='$JOLD_NATIVE' requested='$JOLD_REQUESTED' bootstrap='$JOLD_BOOT' signal='$JOLD_SIGNAL' mode='$JOLD_MODE' reason='$JOLD_REASON'"
+[ "$TURNS4" = "4" ] && hit "L10_OLD_BOOTSTRAP_DURABLE  (第四轮完整落盘，没有并发重号)" || miss "L10_OLD_BOOTSTRAP_DURABLE  (turn 数=$TURNS4)"
+case "$TURN4_ANSWER" in
+  *"$RECALL_TOKEN"*) hit "L10_OLD_BOOTSTRAP_RECALL  (绑定缺失时用 DSH 历史回放仍能回忆首轮 token)" ;;
+  *) miss "L10_OLD_BOOTSTRAP_RECALL  (历史回放没有回忆 token: '$(echo "$TURN4_ANSWER" | head -c 180)')" ;;
+esac
+if [ "$JOLD_REQUESTED" = "" ] && [ "$JOLD_BOOT" = "true" ] && [ "$JOLD_SIGNAL" = "binding-missing" ] && [ "$JOLD_MODE" = "bootstrap" ] && [ "$JOLD_REASON" = "binding-missing" ]; then
+  hit "L10_OLD_BOOTSTRAP_EVIDENCE  (旧绑定缺失原因与 bootstrap 模式如实落证据)"
+else
+  miss "L10_OLD_BOOTSTRAP_EVIDENCE  (requested='$JOLD_REQUESTED' bootstrap='$JOLD_BOOT' signal='$JOLD_SIGNAL' mode='$JOLD_MODE' reason='$JOLD_REASON')"
+fi
+OLD_NATIVE_AFTER="$JOLD_NATIVE"
+BOUND_AFTER_OLD="$(bind_pi_id)"
+if [ -n "$OLD_NATIVE_AFTER" ] && [ "$OLD_NATIVE_AFTER" != "$BOUND_BEFORE_OLD" ] && [ "$BOUND_AFTER_OLD" = "$OLD_NATIVE_AFTER" ]; then
+  hit "L10_OLD_BOOTSTRAP_REBIND  (Bootstrap 后新 native id 已重新持久化)"
+else
+  miss "L10_OLD_BOOTSTRAP_REBIND  (before='$BOUND_BEFORE_OLD' native='$OLD_NATIVE_AFTER' binding='$BOUND_AFTER_OLD')"
+fi
+
+# ---------- 9.3) 绑定存在但 native 会话文件失效：resume 失败后安全回退 ----------
+echo
+echo "--- [9.3] remove the bound native session file, fifth turn: resume-failed fallback ---"
+BOUND_BEFORE_FALLBACK="$(bind_pi_id)"
+BOUND_FILE_BEFORE="$(pi_session_file "$BOUND_BEFORE_FALLBACK")"
+if [ -n "$BOUND_FILE_BEFORE" ]; then
+  mv "$BOUND_FILE_BEFORE" "$INJECT_DIR/removed-pi-session-$(basename "$BOUND_FILE_BEFORE")"
+  hit "L10_FALLBACK_SETUP  (移走绑定指向的 Pi native 会话文件: $(basename "$BOUND_FILE_BEFORE"))"
+else
+  miss "L10_FALLBACK_SETUP  (找不到要移走的 Pi 会话文件 '$BOUND_BEFORE_FALLBACK')"
+fi
+TURN5_RES="$(rpc session/prompt "{\"request\":{\"sessionId\":\"$SESSION_ID\",\"mode\":\"queue\",\"requestId\":\"l10-fifth-resume-fallback\",\"content\":[{\"type\":\"text\",\"text\":\"$CONT_ASK\"}]}}")"
+TURN5_OK="$(echo "$TURN5_RES" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);process.stdout.write(String(j?.result?.ok===true))}catch(e){process.stdout.write('false')}})")"
+[ "$TURN5_OK" = "true" ] && hit "L10_FALLBACK_ACCEPTED  (resume 失效没有把宿主拖挂，prompt 被接受)" || miss "L10_FALLBACK_ACCEPTED  (prompt 失败: $(echo "$TURN5_RES" | head -c 220))"
+wait_turns 5 || true
+TURNS5="$(turn_count)"
+TURN5_ANSWER="$(assistant_for_turn 5)"
+JFB_SIGNAL="$(jsonq "$EVIDENCE" '$ && $.modelAttempt && $.modelAttempt.nativeSessionFallback')"
+JFB_REASON="$(jsonq "$EVIDENCE" '$ && $.piContinuityAttempt && $.piContinuityAttempt.fallbackReason')"
+JFB_MODE="$(jsonq "$EVIDENCE" '$ && $.piContinuityAttempt && $.piContinuityAttempt.mode')"
+JFB_BINDING_COUNT="$(jsonq "$EVIDENCE" '$ && $.piContinuity && $.piContinuity.fallbackCounts && $.piContinuity.fallbackCounts["binding-missing"]')"
+JFB_RESUME_COUNT="$(jsonq "$EVIDENCE" '$ && $.piContinuity && $.piContinuity.fallbackCounts && $.piContinuity.fallbackCounts["resume-failed"]')"
+echo "resume fallback: signal='$JFB_SIGNAL' reason='$(echo "$JFB_REASON" | head -c 100)' mode='$JFB_MODE' cumulative(binding='$JFB_BINDING_COUNT', resume='$JFB_RESUME_COUNT')"
+[ "$TURNS5" = "5" ] && hit "L10_FALLBACK_DURABLE  (第五轮在回退后完整落盘)" || miss "L10_FALLBACK_DURABLE  (turn 数=$TURNS5)"
+case "$TURN5_ANSWER" in
+  *"$RECALL_TOKEN"*) hit "L10_FALLBACK_RECALL  (Pi native 文件失效后仍用 DSH 历史回忆首轮 token)" ;;
+  *) miss "L10_FALLBACK_RECALL  (回退后没有回忆 token: '$(echo "$TURN5_ANSWER" | head -c 180)')" ;;
+esac
+case "$JFB_REASON" in
+  *"not found"*|*"Not found"*) hit "L10_FALLBACK_REASON  (resume 失败原因如实落证据)" ;;
+  *) miss "L10_FALLBACK_REASON  (fallbackReason='$(echo "$JFB_REASON" | head -c 100)')" ;;
+esac
+if [ "$JFB_SIGNAL" = "resume-failed" ] && [ "$JFB_MODE" = "bootstrap" ] && [ "$JFB_BINDING_COUNT" -ge 1 ] 2>/dev/null && [ "$JFB_RESUME_COUNT" -ge 1 ] 2>/dev/null; then
+  hit "L10_FALLBACK_CUMULATIVE  (binding-missing 与 resume-failed 作为累计信号同时保留，不被后续 attempt 覆盖)"
+else
+  miss "L10_FALLBACK_CUMULATIVE  (signal='$JFB_SIGNAL' mode='$JFB_MODE' binding='$JFB_BINDING_COUNT' resume='$JFB_RESUME_COUNT')"
+fi
+NEW_SID="$(bind_pi_id)"
+NEW_SID_FILE="$(pi_session_file "$NEW_SID")"
+if [ -n "$NEW_SID" ] && [ "$NEW_SID" != "$BOUND_BEFORE_FALLBACK" ] && [ -n "$NEW_SID_FILE" ]; then
+  hit "L10_FALLBACK_REBIND  (resume 失败后重新绑定到新 Pi 会话并落盘)"
+else
+  miss "L10_FALLBACK_REBIND  (old='$BOUND_BEFORE_FALLBACK' new='$NEW_SID' file='$NEW_SID_FILE')"
+fi
 
 # ---------- 8.5) 真机负向防误杀：以 engine=native 注入再起一次，模型目录里不得有 pi 组 ----------
 echo
@@ -525,11 +794,17 @@ else
   HOST_PID=""
 fi
 
-REAL_AFTER="$(fp_dir "$REAL_DSH" 2>/dev/null | shasum -a 256)"
-if [ "$REAL_BEFORE" = "$REAL_AFTER" ]; then
-  hit "REAL_HOMEDIR_UNTOUCHED  (真实 ~/.dsh 指纹前后一致)"
+REAL_SCOPE_AFTER="$(fp_dsh_scope 2>/dev/null)"
+REAL_AMBIENT_AFTER="$(fp_dsh_ambient 2>/dev/null)"
+if [ "$REAL_SCOPE_BEFORE" = "$REAL_SCOPE_AFTER" ]; then
+  hit "REAL_HOMEDIR_UNTOUCHED  (真实 ~/.dsh 的 sessions/storages/profiles 指纹前后一致)"
 else
-  miss "REAL_HOMEDIR_UNTOUCHED  (真实 ~/.dsh 指纹变了 —— 本测试只应写隔离 DSH_HOME)"
+  miss "REAL_HOMEDIR_UNTOUCHED  (真实 ~/.dsh 的 sessions/storages/profiles 被写：本测试只应写隔离 DSH_HOME)"
+fi
+if [ "$REAL_AMBIENT_BEFORE" = "$REAL_AMBIENT_AFTER" ]; then
+  hit "REAL_HOMEDIR_AMBIENT_STABLE  (断言范围外的 ~/.dsh 顶层文件未变化)"
+else
+  hit "REAL_HOMEDIR_AMBIENT_CHANGED  (断言范围外的 ~/.dsh 文件发生变化，仅报告不判失败)"
 fi
 
 echo

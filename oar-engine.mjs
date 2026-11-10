@@ -43,6 +43,10 @@ import {
   PI_DEFAULT_MODEL,
   PI_DEFAULT_PROVIDER,
 } from './pi-models.mjs'
+import {
+  createPiNativeSessionStore,
+  formatPiBootstrapPrompt,
+} from './pi-context.mjs'
 
 /** 引擎标识（与 pi-engine.mjs 保持一致）。 */
 export const PI_ENGINE_ID = 'pi'
@@ -88,6 +92,12 @@ export function isPiMarked(options) {
   const fromMeta =
     meta !== null && typeof meta === 'object' ? meta.engine : undefined
   return fromMeta === OAR_ENGINE_ID || options.engine === OAR_ENGINE_ID
+}
+
+/** 从一次 attempt 的 options/subject 里取真实 DSH 会话 id。 */
+function attemptSessionId(options, subject) {
+  const raw = options?.sessionId ?? options?.resumeSessionId ?? subject?.id
+  return typeof raw === 'string' && raw.length > 0 ? raw : null
 }
 
 /**
@@ -231,6 +241,8 @@ export function createOarFrameMapper(ctx, subject, text, opts = {}) {
  * @param {string} [config.provider] 显式指定 provider（默认 magpie）
  * @param {string} [config.model] 显式指定 model（默认 auto/deepseek-v4.1-flash）
  * @param {string} [config.cwd] 工作目录
+ * @param {object} [config.nativeSessionStore] DSH session → Pi native session 的持久绑定
+ * @param {string} [config.nativeSessionDir] 未传 store 时的绑定文件目录
  * @param {object} [config.sessionHost] 会话/Agent 生命周期宿主（pi-session.mjs）：
  *   ① 每次 attempt 开头问它要身份（`subjectFor`）——有会话时必须是**同一个** Agent 对象，
  *      否则流式帧与注册表里的身份会一分为二；
@@ -238,6 +250,11 @@ export function createOarFrameMapper(ctx, subject, text, opts = {}) {
  *      这样帧的 `agent.session.id` 从一开始就是真实会话 id（前端按会话 id 订阅）。
  */
 export function createOarEngine(config = {}) {
+  const nativeSessions =
+    config.nativeSessionStore ??
+    createPiNativeSessionStore({
+      dir: config.nativeSessionDir,
+    })
   const stats = {
     createAgent: 0,
     resume: 0,
@@ -248,6 +265,9 @@ export function createOarEngine(config = {}) {
     runtimeId: null,
     effectiveProvider: null,
     effectiveModel: null,
+    nativeSessionsBound: 0,
+    nativeSessionsResumed: 0,
+    nativeSessionFallbacks: 0,
   }
 
   /** 每次 attempt 的结构化留档（供 smoke 断言/证据引用）。 */
@@ -354,6 +374,20 @@ export function createOarEngine(config = {}) {
       modelEffort: null,
       modelEffortOmitted: null,
       modelRequested: null,
+      // L10 上下文续接：Pi 原生 id、resume 结果与旧会话 Bootstrap。
+      nativePiSessionId: null,
+      nativeSessionRequested: null,
+      nativeSessionResumed: false,
+      nativeSessionFallback: null,
+      nativeSessionFallbackError: null,
+      nativeSessionStorePath: null,
+      nativeSessionPersisted: false,
+      nativeSessionStoreError: null,
+      historyMessages: 0,
+      bootstrapInjected: false,
+      bootstrapMessageCount: 0,
+      bootstrapChars: 0,
+      piPrompt: o.prompt,
       text: '',
       textDeltas: 0,
       frames: [],
@@ -370,6 +404,12 @@ export function createOarEngine(config = {}) {
     if (typeof sessionHost?.attach === 'function') {
       try {
         await sessionHost.attach(engineCtx, options, subject, kind)
+        const boundCwd =
+          typeof sessionHost.cwdFor === 'function'
+            ? sessionHost.cwdFor(options, subject)
+            : null
+        if (typeof boundCwd === 'string' && boundCwd !== '') o.cwd = boundCwd
+        record.cwd = o.cwd
       } catch (attachError) {
         record.attachError = String(attachError?.message ?? attachError)
       }
@@ -395,6 +435,54 @@ export function createOarEngine(config = {}) {
     // 与 `record.piModel`（最终采用的选择子）分开记，「选区要什么」与「实际用什么」才能分别断言。
     record.modelRequested = resolvedModel.requested ?? null
 
+    const dshSessionId = attemptSessionId(options, subject)
+    const suppliedHistory = Array.isArray(options?.piHistory)
+      ? options.piHistory
+      : null
+    const history =
+      suppliedHistory ??
+      (typeof sessionHost?.historyFor === 'function'
+        ? sessionHost.historyFor(options, subject)
+        : [])
+    record.historyMessages = Array.isArray(history) ? history.length : 0
+
+    // 持久绑定按 DSH session id 读。旧记录里保存了 cwd；cwd 变了就不能拿它去
+    // Pi 的另一个 workspace 里找会话，直接清零并走历史 Bootstrap。
+    const storedBinding =
+      dshSessionId === null
+        ? { ok: false, entry: null, file: null, error: 'missing-dsh-session-id' }
+        : nativeSessions.read(dshSessionId)
+    let nativeSessionId = storedBinding.ok ? storedBinding.entry.piSessionId : null
+    if (
+      nativeSessionId !== null &&
+      typeof storedBinding.entry.cwd === 'string' &&
+      storedBinding.entry.cwd !== o.cwd
+    ) {
+      record.nativeSessionFallback = 'cwd-changed'
+      record.nativeSessionFallbackError = `stored cwd ${storedBinding.entry.cwd} != current cwd ${o.cwd}`
+      stats.nativeSessionFallbacks += 1
+      nativeSessions.clear(dshSessionId)
+      nativeSessionId = null
+    }
+    if (nativeSessionId === null && Array.isArray(history) && history.length > 0) {
+      if (storedBinding.error === 'not-found') {
+        record.nativeSessionFallback = 'binding-missing'
+        stats.nativeSessionFallbacks += 1
+      } else if (storedBinding.error === 'invalid-record') {
+        record.nativeSessionFallback = 'binding-invalid'
+        record.nativeSessionFallbackError = 'stored native binding is invalid'
+        stats.nativeSessionFallbacks += 1
+      } else if (
+        storedBinding.error !== null &&
+        storedBinding.error !== 'store-disabled'
+      ) {
+        record.nativeSessionFallback = 'binding-read-failed'
+        record.nativeSessionFallbackError = storedBinding.error
+        stats.nativeSessionFallbacks += 1
+      }
+    }
+    record.nativeSessionRequested = nativeSessionId
+
     let session = null
     try {
       // 第 1 步：require('pi') 拿 runtime
@@ -418,14 +506,61 @@ export function createOarEngine(config = {}) {
         }
       }
 
-      // 第 3 步：piSession(installation, {cwd, model, effort?})
+      // 第 3 步：piSession(installation, {cwd, model, effort?, resume?})
       // model 是**解析出来的** pi 全限定选择子（`provider/modelId`，model id 自己可以带 `/`）；
       // effort 是 pi 的 thinking level，只在该模型真的提供时才透传（见 pi-models.mjs 的说明）。
-      session = await piSession(installation, {
+      const sessionOptions = {
         cwd: o.cwd,
         ...record.piModel === null || record.piModel === undefined ? {} : { model: record.piModel },
         ...record.modelEffort === null || record.modelEffort === undefined ? {} : { effort: record.modelEffort },
-      })
+      }
+      const bootstrap = formatPiBootstrapPrompt(history, o.prompt)
+
+      if (nativeSessionId !== null) {
+        try {
+          session = await piSession(installation, {
+            ...sessionOptions,
+            resume: nativeSessionId,
+          })
+          record.nativeSessionResumed = true
+          stats.nativeSessionsResumed += 1
+          record.piPrompt = o.prompt
+        } catch (resumeError) {
+          // Pi 原生会话可能因文件被清、cwd 迁移、工具图不兼容等原因无法续接。
+          // 失败不能静默失忆：清掉坏绑定，用 DSH 历史开新会话，并把原因落证据。
+          record.nativeSessionFallback = 'resume-failed'
+          record.nativeSessionFallbackError = String(resumeError?.message ?? resumeError)
+          stats.nativeSessionFallbacks += 1
+          nativeSessions.clear(dshSessionId)
+          session = await piSession(installation, sessionOptions)
+        }
+      } else {
+        session = await piSession(installation, sessionOptions)
+      }
+
+      // 只有在没有成功 resume 时才注入 DSH 历史；成功 resume 的原生会话已经持有上下文，
+      // 再注入一次会造成重复和 token 膨胀。
+      if (!record.nativeSessionResumed) {
+        record.bootstrapInjected = bootstrap.injected
+        record.bootstrapMessageCount = bootstrap.messageCount
+        record.bootstrapChars = bootstrap.chars
+        record.piPrompt = bootstrap.prompt
+      }
+
+      // 记录本次真正打开的 Pi 原生 id。绑定按 DSH session id 持久化，重启后仍能 resume。
+      record.nativePiSessionId = typeof session.id === 'string' && session.id !== '' ? session.id : null
+      if (dshSessionId !== null && record.nativePiSessionId !== null) {
+        const saved = nativeSessions.write(dshSessionId, {
+          piSessionId: record.nativePiSessionId,
+          cwd: o.cwd,
+          model: record.piModel,
+          effort: record.modelEffort,
+        })
+        record.nativeSessionStorePath = saved.file
+        record.nativeSessionPersisted = saved.ok
+        record.nativeSessionStoreError = saved.error
+        if (saved.ok) stats.nativeSessionsBound += 1
+      }
 
       // 读回实际使用的 model id：OAR 已做了「不相等就抛」的硬校验，这里再留一份可断言的证据。
       const modelInfo = session.model()
@@ -439,8 +574,8 @@ export function createOarEngine(config = {}) {
       const effectiveSplit = splitPiModelId(modelInfo.value)
       if (effectiveSplit !== null) record.provider = effectiveSplit.providerId
 
-      // 第 4 步：promptAndWait(session, text)
-      const result = await promptAndWait(session, o.prompt)
+      // 第 4 步：promptAndWait(session, effective prompt)
+      const result = await promptAndWait(session, record.piPrompt)
 
       // 检查返回结果
       if (result.outcome.kind !== 'completed') {

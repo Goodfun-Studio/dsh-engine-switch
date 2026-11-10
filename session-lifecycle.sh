@@ -9,9 +9,17 @@
 # 退出码：全部 HIT → 0；任一 MISS → 1。
 set -euo pipefail
 
-# 推导根目录：优先使用 DSH_WORKSPACE 环境变量，否则从脚本位置推导
-ROOT="${DSH_WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
-SWITCH="$ROOT/dsh-engine-switch"
+# 推导依赖根目录：优先使用 DSH_WORKSPACE 环境变量，否则从脚本位置推导。
+# 隔离 worktree 本身就是插件根；常规安装布局则是 workspace/dsh-engine-switch。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="${DSH_WORKSPACE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+if [ -n "${DSH_SWITCH:-}" ]; then
+  SWITCH="$DSH_SWITCH"
+elif [ -f "$SCRIPT_DIR/package.json" ]; then
+  SWITCH="$SCRIPT_DIR"
+else
+  SWITCH="$ROOT/dsh-engine-switch"
+fi
 cd "$SWITCH"
 
 echo "=== session-lifecycle: pi 引擎的会话 / Agent 生命周期（身份 / 落盘 / 注册 / 首轮 / 负向）==="
