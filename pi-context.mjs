@@ -124,6 +124,7 @@ export function nativeSessionFileName(sessionId) {
 export function createPiNativeSessionStore(config = {}) {
   const dir =
     typeof config.dir === 'string' && config.dir.trim() !== '' ? config.dir : null
+  const stats = { read: 0, write: 0, clear: 0 }
 
   const fileFor = (sessionId) =>
     dir === null || typeof sessionId !== 'string' || sessionId === ''
@@ -135,6 +136,7 @@ export function createPiNativeSessionStore(config = {}) {
    * @param {string} sessionId
    */
   const read = (sessionId) => {
+    stats.read += 1
     const file = fileFor(sessionId)
     if (file === null) return { ok: false, entry: null, file: null, error: 'store-disabled' }
     try {
@@ -165,6 +167,7 @@ export function createPiNativeSessionStore(config = {}) {
    * @param {{piSessionId:string,cwd?:string|null,model?:string|null,effort?:string|null}} entry
    */
   const write = (sessionId, entry) => {
+    stats.write += 1
     const file = fileFor(sessionId)
     if (file === null) return { ok: false, file: null, error: 'store-disabled' }
     if (typeof entry?.piSessionId !== 'string' || entry.piSessionId === '') {
@@ -195,6 +198,7 @@ export function createPiNativeSessionStore(config = {}) {
    * @param {string} sessionId
    */
   const clear = (sessionId) => {
+    stats.clear += 1
     const file = fileFor(sessionId)
     if (file === null) return { ok: false, removed: false, file: null, error: 'store-disabled' }
     try {
@@ -210,5 +214,5 @@ export function createPiNativeSessionStore(config = {}) {
     }
   }
 
-  return { dir, fileFor, read, write, clear }
+  return { dir, fileFor, read, write, clear, stats }
 }

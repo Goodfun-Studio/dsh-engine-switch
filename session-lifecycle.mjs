@@ -42,8 +42,12 @@
 import { registerHooks } from 'node:module'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -178,6 +182,215 @@ const check = (tag, name, cond) => {
   return ok
 }
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms))
+
+const deepSnapshot = (value) => structuredClone(value)
+
+/**
+ * Binding 存储的完整测试快照：相对路径、类型、mtime、大小与内容 hash 都纳入。
+ * 这样读取本身不会改变快照，而 create/update/delete 任一动作都会让对应字段变化。
+ */
+function snapshotTree(root) {
+  if (typeof root !== 'string' || root === '' || !existsSync(root)) {
+    return { root: root ?? null, entries: [] }
+  }
+  const entries = []
+  const walk = (relative = '') => {
+    const absolute = relative === '' ? root : join(root, relative)
+    const children = readdirSync(absolute, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )
+    for (const child of children) {
+      const childRelative = relative === '' ? child.name : join(relative, child.name)
+      const childAbsolute = join(root, childRelative)
+      const stat = lstatSync(childAbsolute)
+      const common = {
+        path: childRelative,
+        mode: stat.mode,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      }
+      if (child.isDirectory()) {
+        entries.push({ ...common, type: 'dir' })
+        walk(childRelative)
+      } else if (child.isFile()) {
+        entries.push({
+          ...common,
+          type: 'file',
+          sha256: createHash('sha256').update(readFileSync(childAbsolute)).digest('hex'),
+        })
+      } else {
+        entries.push({ ...common, type: 'other' })
+      }
+    }
+  }
+  walk()
+  return { root, entries }
+}
+
+/**
+ * Native 负向守卫的独立故障注入 harness。
+ *
+ * 正常调用必须同时满足：options 前后深相等、receiver 收到深快照、binding 树不变、
+ * binding read/write/clear 均为 0、Pi runner 与 Bootstrap 均未调用。
+ * fault 参数只改变 target 的行为，不进入生产路由；子进程应因对应守卫 MISS 而 exit=1。
+ */
+async function runNativeGuard(fault = null) {
+  const options = {
+    sessionId: `native-guard-${fault ?? 'baseline'}`,
+    meta: {
+      cwd: '/tmp/dsh-native-guard/workspace',
+      agentPreset: 'standard',
+      routeProbe: {
+        flags: [true, false, true],
+        nested: { mode: 'strict', labels: ['alpha', 'beta'] },
+      },
+    },
+    agentOptions: {
+      provider: 'magpie',
+      model: 'auto/deepseek-v4.1-flash',
+      reasoningEffort: 'high',
+      routingProbe: {
+        levels: [
+          { id: 1, enabled: true },
+          { id: 2, enabled: false },
+        ],
+        tags: ['one', 'two'],
+      },
+    },
+  }
+  const before = deepSnapshot(options)
+  const bindingState = new Map([
+    ['existing-session', { piSessionId: 'pi-existing', cwd: '/tmp/dsh-native-guard/workspace' }],
+  ])
+  const bindingCalls = { read: 0, write: 0, clear: 0 }
+  const bindingSnapshot = () => deepSnapshot([...bindingState.entries()])
+  const bindingsBefore = bindingSnapshot()
+  const bindingStore = {
+    read(sessionId) {
+      bindingCalls.read += 1
+      const entry = bindingState.get(sessionId) ?? null
+      return { ok: entry !== null, entry, file: null, error: entry === null ? 'not-found' : null }
+    },
+    write(sessionId, entry) {
+      bindingCalls.write += 1
+      bindingState.set(sessionId, deepSnapshot(entry))
+      return { ok: true, file: null, entry, error: null }
+    },
+    clear(sessionId) {
+      bindingCalls.clear += 1
+      const removed = bindingState.delete(sessionId)
+      return { ok: true, removed, file: null, error: null }
+    },
+  }
+  const piCalls = { runner: 0, bootstrap: 0 }
+  const piEngine = {
+    async createAgent() {
+      piCalls.runner += 1
+      return { agent: { id: 'unexpected-pi-agent' } }
+    },
+    async resume() {
+      piCalls.runner += 1
+      return { agent: { id: 'unexpected-pi-agent' } }
+    },
+  }
+  const nativeResult = { agent: { id: 'native-guard-sentinel' } }
+  const received = []
+  const nativeTarget = {
+    async createAgent(_ctx, callOptions) {
+      received.push(callOptions)
+      if (fault === 'mutate-meta-cwd') callOptions.meta.cwd = '/tmp/dsh-native-guard/mutated'
+      if (fault === 'mutate-nested-options') {
+        callOptions.agentOptions.routingProbe.levels[1].enabled = true
+        callOptions.meta.routeProbe.flags[1] = true
+      }
+      if (fault === 'read-binding') bindingStore.read('existing-session')
+      if (fault === 'create-binding') {
+        bindingStore.write('created-session', {
+          piSessionId: 'pi-created',
+          cwd: '/tmp/dsh-native-guard/workspace',
+        })
+      }
+      if (fault === 'update-binding') {
+        bindingStore.write('existing-session', {
+          piSessionId: 'pi-updated',
+          cwd: '/tmp/dsh-native-guard/workspace',
+        })
+      }
+      if (fault === 'clear-binding') bindingStore.clear('existing-session')
+      if (fault === 'call-pi') await piEngine.createAgent({}, callOptions)
+      if (fault === 'call-bootstrap') piCalls.bootstrap += 1
+      return nativeResult
+    },
+    async resume() {
+      return nativeResult
+    },
+  }
+  const router = plug.createRouter(
+    nativeTarget,
+    { async createAgent() {}, async resume() {} },
+    piEngine,
+    { forceEngine: 'native', readConfigEngine: () => 'native' },
+  )
+  const result = await router.createAgent({}, options)
+  const after = deepSnapshot(options)
+  const receivedBefore = received[0] === undefined ? null : deepSnapshot(received[0])
+  const bindingsAfter = bindingSnapshot()
+  const checks = [
+    {
+      name: 'NATIVE_TARGET_ONCE',
+      ok: received.length === 1 && result === nativeResult,
+    },
+    {
+      name: 'NATIVE_OPTIONS_CALLER_SNAPSHOT_STABLE',
+      ok: isDeepStrictEqual(after, before),
+    },
+    {
+      name: 'NATIVE_OPTIONS_RECEIVER_DEEP_EQUAL',
+      ok: receivedBefore !== null && isDeepStrictEqual(receivedBefore, before),
+    },
+    {
+      name: 'NATIVE_OPTIONS_RECEIVER_AFTER_CALL_STABLE',
+      ok: received[0] !== undefined && isDeepStrictEqual(received[0], before),
+    },
+    {
+      name: 'NATIVE_BINDING_STORE_SNAPSHOT_STABLE',
+      ok: isDeepStrictEqual(bindingsAfter, bindingsBefore),
+    },
+    {
+      name: 'NATIVE_BINDING_READ_ZERO',
+      ok: bindingCalls.read === 0,
+    },
+    {
+      name: 'NATIVE_BINDING_WRITE_CREATE_UPDATE_ZERO',
+      ok: bindingCalls.write === 0,
+    },
+    {
+      name: 'NATIVE_BINDING_CLEAR_DELETE_ZERO',
+      ok: bindingCalls.clear === 0,
+    },
+    {
+      name: 'NATIVE_PI_RUNNER_ZERO',
+      ok: piCalls.runner === 0,
+    },
+    {
+      name: 'NATIVE_BOOTSTRAP_ZERO',
+      ok: piCalls.bootstrap === 0,
+    },
+  ]
+  return { checks, bindingCalls, piCalls, received: received.length }
+}
+
+const nativeGuardChildSeparator = process.argv.indexOf('--native-guard-child')
+if (nativeGuardChildSeparator !== -1) {
+  const fault = process.argv[nativeGuardChildSeparator + 1] ?? null
+  const guard = await runNativeGuard(fault)
+  for (const assertion of guard.checks) {
+    console.log(`[${assertion.ok ? 'HIT' : 'MISS'}] NATIVE_GUARD :: ${assertion.name}`)
+  }
+  const misses = guard.checks.filter((assertion) => !assertion.ok)
+  console.log(`GUARD_RESULT: ${misses.length === 0 ? 'PASS' : 'FAIL'} (${fault ?? 'baseline'})`)
+  process.exit(misses.length === 0 ? 0 : 1)
+}
 
 /**
  * 最小但**真折叠**的 sessionProjections 替身：按定义逐事件 fold，`stateOf(session)`
@@ -864,36 +1077,182 @@ pluginConfig.engine[plug.VOLATILE_WRITE]('native')
 await tick(20)
 
 const NATIVE_SESSION = 'session-l7nat0001-0000-4000-8000-000000000002'
+const nativeState = ctx.agents.factory?.target?.[plug.STATE]
+const nativeSessionStore = nativeState?.nativeSessionStore ?? null
+const nativePiEngine = nativeState?.piEngine ?? null
+const observedNativeStoreDir =
+  nativeSessionStore?.dir ?? join(piAgentDir, 'dsh-engine-switch', 'native-sessions')
+const nativePathBoundary = () => ({
+  storeStats: nativeSessionStore === null ? null : deepSnapshot(nativeSessionStore.stats),
+  bindingTree: snapshotTree(observedNativeStoreDir),
+  piAttempts: nativePiEngine?.stats?.attempts ?? null,
+  piAttemptRecords: nativePiEngine?.attempts?.length ?? null,
+  oarCalls: oar.oarCalls.length,
+})
 const nativeBefore = nativeCalls.length
 const piEvidenceBefore = readEvidence().piByKind.createAgent
 const nativeOptions = {
   sessionId: NATIVE_SESSION,
-  meta: { cwd: CWD, agentPreset: 'standard' },
-  agentOptions: piProfile,
+  meta: {
+    cwd: CWD,
+    agentPreset: 'standard',
+    routeProbe: {
+      flags: [true, false, true],
+      nested: { mode: 'strict', labels: ['alpha', 'beta'] },
+    },
+  },
+  agentOptions: {
+    ...piProfile,
+    routingProbe: {
+      levels: [
+        { id: 1, enabled: true },
+        { id: 2, enabled: false },
+      ],
+      tags: ['one', 'two'],
+    },
+  },
 }
+const nativeOptionsBefore = deepSnapshot(nativeOptions)
+const nativeBoundaryBeforeCreate = nativePathBoundary()
+check(
+  'NEG_NATIVE_STORE',
+  'binding 操作计数是活信号：Native 测试前 Pi 路径已真实累计 read/write/clear，且 store 没有 create/update/delete 旁路 API',
+  nativeSessionStore !== null &&
+    nativeSessionStore.stats.read > 0 &&
+    nativeSessionStore.stats.write > 0 &&
+    nativeSessionStore.stats.clear > 0 &&
+    typeof nativeSessionStore.create !== 'function' &&
+    typeof nativeSessionStore.update !== 'function' &&
+    typeof nativeSessionStore.delete !== 'function',
+)
 const nativeCreated = await ctx.agents.create(nativeOptions)
 const nativeResult = nativeCreated?.agent
+const nativeOptionsAfter = deepSnapshot(nativeOptions)
+const nativeBoundaryAfterCreate = nativePathBoundary()
+const nativeCall = nativeCalls[nativeBefore]
 
 check(
   'NEG_NATIVE',
   'engine=native（选择器）下 create 原样直通原生 target：交回的就是原生 target 的 agent（恒等，不包装）',
-  nativeCalls.length === nativeBefore + 1 && nativeResult === NATIVE_SENTINEL && nativeCreated === nativeCalls[nativeBefore].result,
+  nativeCalls.length === nativeBefore + 1 &&
+    nativeResult === NATIVE_SENTINEL &&
+    nativeCreated === nativeCall?.result,
 )
 check(
-  'NEG_NATIVE',
-  '原生 target 收到的是**逐字原样**的调用参数（sessionId / meta / agentOptions 一个不改）',
-  nativeCalls[nativeBefore].kind === 'createAgent' &&
-    nativeCalls[nativeBefore].options === nativeOptions,
+  'NEG_NATIVE_OPTIONS',
+  'Native create 的 caller options 在调用前保存深快照，调用后再次深比较完全不变（含 cwd/meta/agentOptions）',
+  isDeepStrictEqual(nativeOptionsAfter, nativeOptionsBefore) &&
+    nativeOptionsAfter.meta.cwd === CWD,
+)
+check(
+  'NEG_NATIVE_OPTIONS',
+  'Native target 收到的 options 按值深等于调用前快照：嵌套对象/数组逐字段不变（不只比较对象引用）',
+  nativeCall?.kind === 'createAgent' &&
+    isDeepStrictEqual(nativeCall.options, nativeOptionsBefore) &&
+    isDeepStrictEqual(
+      nativeCall.options.meta.routeProbe.nested.labels,
+      nativeOptionsBefore.meta.routeProbe.nested.labels,
+    ) &&
+    isDeepStrictEqual(
+      nativeCall.options.agentOptions.routingProbe.levels,
+      nativeOptionsBefore.agentOptions.routingProbe.levels,
+    ),
+)
+check(
+  'NEG_NATIVE_STORE',
+  'Native create 前后 binding 存储完整快照不变（路径/类型/mtime/size/content hash 全相等）',
+  isDeepStrictEqual(
+    nativeBoundaryAfterCreate.bindingTree,
+    nativeBoundaryBeforeCreate.bindingTree,
+  ),
+)
+check(
+  'NEG_NATIVE_STORE',
+  'Native create 的 binding read/write/clear 计数均为 0（write 覆盖 create/update，clear 覆盖 delete）',
+  nativeSessionStore !== null &&
+    isDeepStrictEqual(
+      nativeBoundaryAfterCreate.storeStats,
+      nativeBoundaryBeforeCreate.storeStats,
+    ) &&
+    nativeBoundaryAfterCreate.storeStats.read === nativeBoundaryBeforeCreate.storeStats.read &&
+    nativeBoundaryAfterCreate.storeStats.write === nativeBoundaryBeforeCreate.storeStats.write &&
+    nativeBoundaryAfterCreate.storeStats.clear === nativeBoundaryBeforeCreate.storeStats.clear,
 )
 check(
   'NEG_NATIVE',
   'pi 引擎零调用（证据 piByKind.createAgent 未上升）—— 没有偷偷把原生会话交给 pi',
-  readEvidence().piByKind.createAgent === piEvidenceBefore,
+  readEvidence().piByKind.createAgent === piEvidenceBefore &&
+    nativeBoundaryAfterCreate.piAttempts === nativeBoundaryBeforeCreate.piAttempts &&
+    nativeBoundaryAfterCreate.oarCalls === nativeBoundaryBeforeCreate.oarCalls,
+)
+check(
+  'NEG_NATIVE',
+  'Native create 不新增任何 Pi attempt 记录，因此也不可能执行 Bootstrap formatter',
+  nativePiEngine !== null &&
+    nativeBoundaryAfterCreate.piAttemptRecords ===
+      nativeBoundaryBeforeCreate.piAttemptRecords,
 )
 check(
   'NEG_NATIVE',
   '没有替身污染：原生路径不产生 standIn Agent，也不给会话塞 pi 前缀身份',
   nativeResult?.standIn === undefined && !String(nativeResult?.id ?? '').includes('oar-pi'),
+)
+
+const nativeResumeOptions = {
+  resumeSessionId: NATIVE_SESSION,
+  meta: {
+    cwd: CWD,
+    agentPreset: 'standard',
+    routeProbe: {
+      flags: ['resume', false],
+      nested: { mode: 'strict-resume', labels: ['gamma', 'delta'] },
+    },
+  },
+  agentOptions: {
+    ...piProfile,
+    routingProbe: {
+      levels: [
+        { id: 10, enabled: true },
+        { id: 20, enabled: false },
+      ],
+      tags: ['resume-one', 'resume-two'],
+    },
+  },
+}
+const nativeResumeSnapshot = deepSnapshot(nativeResumeOptions)
+const nativeResumeBoundaryBefore = nativePathBoundary()
+const nativeResumeIndex = nativeCalls.length
+await ctx.agents.resume(nativeResumeOptions)
+const nativeResumeCall = nativeCalls[nativeResumeIndex]
+const nativeResumeBoundaryAfter = nativePathBoundary()
+check(
+  'NEG_NATIVE_OPTIONS',
+  'Native resume 同样保留调用前快照，target 收到的 options 与调用后 caller options 均深相等',
+  isDeepStrictEqual(nativeResumeOptions, nativeResumeSnapshot) &&
+    nativeResumeCall?.kind === 'resume' &&
+    isDeepStrictEqual(nativeResumeCall.options, nativeResumeSnapshot),
+)
+check(
+  'NEG_NATIVE_STORE',
+  'Native resume 前后 binding 树不变且 read/write/clear 计数仍为 0',
+  nativeSessionStore !== null &&
+    isDeepStrictEqual(
+      nativeResumeBoundaryAfter.bindingTree,
+      nativeResumeBoundaryBefore.bindingTree,
+    ) &&
+    isDeepStrictEqual(
+      nativeResumeBoundaryAfter.storeStats,
+      nativeResumeBoundaryBefore.storeStats,
+    ),
+)
+check(
+  'NEG_NATIVE',
+  'Native resume 不调用 Pi runner、不新增 Bootstrap attempt、不增加 OAR 调用数',
+  nativePiEngine !== null &&
+    nativeResumeBoundaryAfter.piAttempts === nativeResumeBoundaryBefore.piAttempts &&
+    nativeResumeBoundaryAfter.piAttemptRecords ===
+      nativeResumeBoundaryBefore.piAttemptRecords &&
+    nativeResumeBoundaryAfter.oarCalls === nativeResumeBoundaryBefore.oarCalls,
 )
 
 const NATIVE_SESSION_2 = 'session-l7nat0002-0000-4000-8000-000000000003'
@@ -1085,9 +1444,58 @@ check(
 
 cleanup()
 
+// ---------------------------------------------------------------------------
+// F. Native 负向守卫 mutation：baseline 必须全 HIT；每个独立子进程故障必须
+//    在对应断言上 MISS 且 exit=1。故障只注入 target spy，不进生产路由分支。
+// ---------------------------------------------------------------------------
+const nativeGuardBaseline = await runNativeGuard()
+for (const assertion of nativeGuardBaseline.checks) {
+  check(
+    'NEG_NATIVE_HARNESS',
+    `baseline ${assertion.name}（正常 Native 路径不得触发守卫）`,
+    assertion.ok,
+  )
+}
+
+const nativeGuardFaults = [
+  ['mutate-meta-cwd', 'NATIVE_OPTIONS_CALLER_SNAPSHOT_STABLE'],
+  ['mutate-nested-options', 'NATIVE_OPTIONS_CALLER_SNAPSHOT_STABLE'],
+  ['read-binding', 'NATIVE_BINDING_READ_ZERO'],
+  ['create-binding', 'NATIVE_BINDING_WRITE_CREATE_UPDATE_ZERO'],
+  ['update-binding', 'NATIVE_BINDING_WRITE_CREATE_UPDATE_ZERO'],
+  ['clear-binding', 'NATIVE_BINDING_CLEAR_DELETE_ZERO'],
+  ['call-pi', 'NATIVE_PI_RUNNER_ZERO'],
+  ['call-bootstrap', 'NATIVE_BOOTSTRAP_ZERO'],
+]
+for (const [fault, expectedMiss] of nativeGuardFaults) {
+  const child = spawnSync(
+    process.execPath,
+    ['--no-warnings', fileURLToPath(import.meta.url), '--native-guard-child', fault],
+    {
+      cwd: SWITCH,
+      env: process.env,
+      encoding: 'utf8',
+    },
+  )
+  const stdout = String(child.stdout ?? '')
+  const caught =
+    child.error === undefined &&
+    child.status === 1 &&
+    stdout.includes(`[MISS] NATIVE_GUARD :: ${expectedMiss}`) &&
+    stdout.includes('GUARD_RESULT: FAIL')
+  console.log(
+    `[FAULT] ${fault} expected_MISS=${expectedMiss} child_EXIT=${String(child.status)}`,
+  )
+  check(
+    'NEG_NATIVE_MUTATION',
+    `${fault} 故障被独立 mutation 捕获：${expectedMiss}=MISS / child exit=1`,
+    caught,
+  )
+}
+
 console.log(`\nSUMMARY: ${pass} HIT / ${fail} MISS`)
 console.log(
-  'ASSERTION_CLASSES: PI_IDENTITY, PI_SESSION, PI_PERSIST, PI_REGISTRY, PI_STREAM, PI_TURN, PI_CONTEXT, NEG_NATIVE, RESUME, UNLOAD',
+  'ASSERTION_CLASSES: PI_IDENTITY, PI_SESSION, PI_PERSIST, PI_REGISTRY, PI_STREAM, PI_TURN, PI_CONTEXT, NEG_NATIVE, NEG_NATIVE_OPTIONS, NEG_NATIVE_STORE, NEG_NATIVE_HARNESS, NEG_NATIVE_MUTATION, RESUME, UNLOAD',
 )
 console.log(fail === 0 ? 'RESULT: PASS' : 'RESULT: FAIL')
 process.exit(fail === 0 ? 0 : 1)
