@@ -32,7 +32,8 @@
  *   · `setup`（preset 挂载 / 模型选择安装）**不执行**：preset 是内容面，pi 引擎按自己的
  *     系统提示词跑；会话 header 仍如实记录 `agentPreset`（身份与引擎正交）。
  *   · 一次 attempt 中途不可打断：`cancel()` 只保证「未提交的 attempt 不再写入会话」。
- *   · `resume`（冷开一个已存在会话）不在本轮范围：`attach` 只服务 create。
+ *   · Pi 原生会话上下文由 oar-engine 负责续接；本模块只把 DSH 已提交历史在
+ *     followup 前快照给 turnRunner，供旧会话/失效 resume 做一次 Bootstrap。
  *
  * ## 依赖注入
  *
@@ -43,6 +44,7 @@
 import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import { conversationHistory } from './pi-context.mjs'
 import { pickModelSelection } from './pi-models.mjs'
 
 /**
@@ -161,6 +163,28 @@ export function textOfUserMessage(message) {
 }
 
 /**
+ * 取一次 followup 的幂等键。DSH RPC 重投会保留 `source.rpcId`，优先按它合并；
+ * 非 RPC 调用没有 rpcId 时退回 message id，仍应避免同一消息被排入两次。
+ *
+ * @param {unknown} message createUserMessage 的产物
+ * @returns {string|null}
+ */
+export function promptRequestKey(message) {
+  if (message === null || typeof message !== 'object') return null
+  const source = message.source
+  if (
+    source?.kind === 'user' &&
+    typeof source.rpcId === 'string' &&
+    source.rpcId !== ''
+  ) {
+    return `rpc:${source.rpcId}`
+  }
+  return typeof message.id === 'string' && message.id !== ''
+    ? `message:${message.id}`
+    : null
+}
+
+/**
  * 构造一段**可落盘的** assistant 流（settlement 字段）。
  *
  * 为什么不能省：会话日志的冷读（`sessionPersistence` 回读 + `Session.fromRestore`）会对
@@ -210,6 +234,26 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
       onEvent(event, detail)
     } catch {
       // 证据写入失败绝不影响主流程（证据是旁路）
+    }
+  }
+
+  /** 取 DSH 已提交消息快照；派生失败只记旁路证据，不让主流程中断。 */
+  function historyOfSession(session) {
+    if (
+      session === null ||
+      typeof session !== 'object' ||
+      typeof session.deriveMessages !== 'function'
+    ) {
+      return []
+    }
+    try {
+      return conversationHistory(session.deriveMessages())
+    } catch (error) {
+      record('pi-session/history-error', {
+        sessionId: typeof session.id === 'string' ? session.id : null,
+        error: String(error?.message ?? error),
+      })
+      return []
     }
   }
 
@@ -283,6 +327,9 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
         published: false,
         status: 'idle',
         inflight: Promise.resolve(),
+        queueTail: Promise.resolve(),
+        pendingTurns: [],
+        requestPromises: new Map(),
         cancelled: false,
         turns: 0,
         lastTurn: null,
@@ -370,6 +417,9 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
       published: false,
       status: 'idle',
       inflight: Promise.resolve(),
+      queueTail: Promise.resolve(),
+      pendingTurns: [],
+      requestPromises: new Map(),
       cancelled: false,
       turns: 0,
       lastTurn: null,
@@ -494,15 +544,52 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
     subject.standIn = true
 
     /**
-     * 队列面：pi 引擎不排队（followup 立即跑一次 attempt），如实给空队列。
-     * `hasPromptRequest` 读 `nextTurn/nextStep`；`session/updateQueue` 想改队列会得到
-     * 「找不到该条目」的诚实失败，而不是假装改成功了。
+     * 队列面：Pi attempt 仍不由 DSH AgentLoop 驱动，但 followup 必须遵守 Agent 的
+     * 串行语义。等待中的消息留在 nextTurn，DSH 的 hasPromptRequest 才能在 turn
+     * 尚未开始时识别同一 rpcId 的重投。
      */
-    subject.inbox = subject.inbox ?? {
-      nextTurn: [],
-      nextStep: [],
-      replace: () => false,
-      remove: () => false,
+    subject.inbox = {
+      get nextTurn() {
+        return entry.pendingTurns.map((item) => item.message)
+      },
+      get nextStep() {
+        return []
+      },
+      clear() {
+        for (const item of entry.pendingTurns) item.removed = true
+        entry.pendingTurns.length = 0
+        entry.requestPromises.clear()
+      },
+      replace(messageId, nextMessage) {
+        const item = entry.pendingTurns.find((candidate) => candidate.message?.id === messageId)
+        if (item === undefined) return false
+        item.message = nextMessage
+        return true
+      },
+      remove(messageId) {
+        const index = entry.pendingTurns.findIndex(
+          (candidate) => candidate.message?.id === messageId,
+        )
+        if (index < 0) return false
+        const [item] = entry.pendingTurns.splice(index, 1)
+        item.removed = true
+        if (item.requestKey !== null && entry.requestPromises.get(item.requestKey) === item.promise) {
+          entry.requestPromises.delete(item.requestKey)
+        }
+        return true
+      },
+      append(_target, message) {
+        subject.followup(message)
+      },
+      prepend(_target, message) {
+        subject.followup(message)
+      },
+      splice(_target, start, deleteCount, inserted) {
+        const removed = entry.pendingTurns.splice(start, deleteCount)
+        for (const item of removed) item.removed = true
+        for (const message of inserted) subject.followup(message)
+        return removed.map((item) => item.message)
+      },
     }
 
     /** 模型面：AgentModel 的最小诚实实现（current/select）。 */
@@ -532,71 +619,51 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
     })
 
     /**
-     * 跑一次 turn：会话事件按真实 DSH 词汇顺序写入，成败都收尾（不留开着 トラック的 turn）。
+     * 入队一次 followup。相同 rpcId 在尚未完成时复用同一个 promise；不同请求严格
+     * 串行，前一轮失败只会拒绝它自己的调用方，不会把后续队列永久卡死。
+     *
      * @param {object} message createUserMessage 产物
-     * @returns {Promise<void>} turn 结束（含失败）后 resolve
+     * @returns {Promise<void>}
      */
     subject.followup = (message) => {
-      const run = (async () => {
-        entry.cancelled = false
-        const turn = nextTurnOf(entry)
-        entry.lastTurn = turn
-        beginTurn(entry, turn)
-        if (message !== undefined && message !== null) {
-          entry.session.append('user/message', message, { surfaceOp: 'append' })
-        }
-        entry.session.append('step/start', { turn, step: 1 })
-        let outcome = null
-        try {
-          outcome = await turnRunner(message, textOfUserMessage(message))
-        } catch (error) {
-          entry.lastError = String(error?.message ?? error)
-          record('pi-session/error', { phase: 'turn', sessionId: entry.sessionId, error: entry.lastError })
-          entry.session.append('turn/end', {
-            turn,
-            reason: { kind: 'error', error: { code: 'pi-engine-error', message: entry.lastError } },
-          })
-          emitStatus(entry, 'idle')
-          await flushSession(entry)
-          throw error
-        }
-        if (entry.cancelled) {
-          entry.session.append('turn/end', { turn, reason: { kind: 'canceled' } })
-          emitStatus(entry, 'idle')
-          await flushSession(entry)
-          return
-        }
-        const text = typeof outcome?.text === 'string' ? outcome.text : ''
-        const provider =
-          typeof outcome?.provider === 'string' && outcome.provider !== '' ? outcome.provider : 'pi'
-        const model =
-          typeof outcome?.model === 'string' && outcome.model !== '' ? outcome.model : 'pi'
-        // source.kind='model' 由 createAssistantMessage 补上；provider/model 如实写 pi 的钉死值
-        const assistantMessage = createAssistantMessage({
-          content: [{ type: 'text', text }],
-          source: { provider, model },
+      const requestKey = promptRequestKey(message)
+      if (requestKey !== null && entry.requestPromises.has(requestKey)) {
+        record('pi-session/request-deduped', {
+          sessionId: entry.sessionId,
+          requestKey,
         })
-        entry.session.append(
-          'assistant/message',
-          {
-            turn,
-            step: 1,
-            message: assistantMessage,
-            // settlement 字段（缺了就会让会话在冷读时被判 corrupt）
-            stream: buildDurableAssistantStream(text),
-          },
-          { surfaceOp: 'append' },
-        )
-        entry.session.append('step/end', { turn, step: 1 })
-        entry.session.append('turn/end', { turn, reason: { kind: 'completed' } })
-        emitStatus(entry, 'idle')
-        await flushSession(entry)
-        entry.turns += 1
-        counters.turns += 1
-        record('pi-session/turn', { sessionId: entry.sessionId, turn, textLength: text.length })
-      })()
-      entry.inflight = run
-      return run
+        return entry.requestPromises.get(requestKey)
+      }
+
+      const item = {
+        message,
+        requestKey,
+        removed: false,
+        promise: null,
+      }
+      entry.pendingTurns.push(item)
+      if (entry.status !== 'running') emitStatus(entry, 'running')
+      const run = entry.queueTail
+        .catch(() => {})
+        .then(async () => {
+          if (item.removed) {
+            if (entry.pendingTurns.length === 0) emitStatus(entry, 'idle')
+            return
+          }
+          const pendingIndex = entry.pendingTurns.indexOf(item)
+          if (pendingIndex >= 0) entry.pendingTurns.splice(pendingIndex, 1)
+          await executeTurn(entry, item.message, turnRunner)
+        })
+      const tracked = run.finally(() => {
+        if (requestKey !== null && entry.requestPromises.get(requestKey) === tracked) {
+          entry.requestPromises.delete(requestKey)
+        }
+      })
+      item.promise = tracked
+      if (requestKey !== null) entry.requestPromises.set(requestKey, tracked)
+      entry.queueTail = tracked.catch(() => {})
+      entry.inflight = entry.queueTail
+      return tracked
     }
 
     // steer 在 pi 引擎里没有「打断当前 step 再插话」的能力：如实当成新一轮 turn。
@@ -607,6 +674,82 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
       return true
     }
     subject.whenIdle = () => entry.inflight
+  }
+
+  /**
+   * 跑一次 turn：会话事件按真实 DSH 词汇顺序写入，成败都收尾（不留开着的事务）。
+   * @param {object} entry 宿主条目
+   * @param {object} message createUserMessage 产物
+   * @param {Function} turnRunner engine attempt
+   * @returns {Promise<void>}
+   */
+  async function executeTurn(entry, message, turnRunner) {
+    entry.cancelled = false
+    const turn = nextTurnOf(entry)
+    entry.lastTurn = turn
+    beginTurn(entry, turn)
+    // 必须在 append 当前 user/message 之前取历史。否则旧会话 Bootstrap 会把
+    // 本轮问题重复一次，模型可能对同一个问题回答两遍。
+    const history = historyOfSession(entry.session)
+    const cwd =
+      typeof entry.session.header?.cwd === 'string' ? entry.session.header.cwd : null
+    if (message !== undefined && message !== null) {
+      entry.session.append('user/message', message, { surfaceOp: 'append' })
+    }
+    entry.session.append('step/start', { turn, step: 1 })
+    let outcome = null
+    try {
+      outcome = await turnRunner(message, textOfUserMessage(message), {
+        history,
+        cwd,
+        sessionId: entry.sessionId,
+        currentMessageId: typeof message?.id === 'string' ? message.id : null,
+      })
+    } catch (error) {
+      entry.lastError = String(error?.message ?? error)
+      record('pi-session/error', { phase: 'turn', sessionId: entry.sessionId, error: entry.lastError })
+      entry.session.append('turn/end', {
+        turn,
+        reason: { kind: 'error', error: { code: 'pi-engine-error', message: entry.lastError } },
+      })
+      emitStatus(entry, entry.pendingTurns.length > 0 ? 'running' : 'idle')
+      await flushSession(entry)
+      throw error
+    }
+    if (entry.cancelled) {
+      entry.session.append('turn/end', { turn, reason: { kind: 'canceled' } })
+      emitStatus(entry, entry.pendingTurns.length > 0 ? 'running' : 'idle')
+      await flushSession(entry)
+      return
+    }
+    const text = typeof outcome?.text === 'string' ? outcome.text : ''
+    const provider =
+      typeof outcome?.provider === 'string' && outcome.provider !== '' ? outcome.provider : 'pi'
+    const model =
+      typeof outcome?.model === 'string' && outcome.model !== '' ? outcome.model : 'pi'
+    // source.kind='model' 由 createAssistantMessage 补上；provider/model 如实写 pi 的钉钉值
+    const assistantMessage = createAssistantMessage({
+      content: [{ type: 'text', text }],
+      source: { provider, model },
+    })
+    entry.session.append(
+      'assistant/message',
+      {
+        turn,
+        step: 1,
+        message: assistantMessage,
+        // settlement 字段（缺了就会让会话在冷读时被判 corrupt）
+        stream: buildDurableAssistantStream(text),
+      },
+      { surfaceOp: 'append' },
+    )
+    entry.session.append('step/end', { turn, step: 1 })
+    entry.session.append('turn/end', { turn, reason: { kind: 'completed' } })
+    emitStatus(entry, entry.pendingTurns.length > 0 ? 'running' : 'idle')
+    await flushSession(entry)
+    entry.turns += 1
+    counters.turns += 1
+    record('pi-session/turn', { sessionId: entry.sessionId, turn, textLength: text.length })
   }
 
   /** 一轮 turn 开始：状态 running（前端「运行中」指示与 session/wait 都读它）。 */
@@ -695,6 +838,26 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
         pickModelSelection(options?.agentOptions)
       )
     },
+    /**
+     * 冷 resume（尚未进入 followup）时读 DSH 已落盘历史。followup 路径由
+     * installAgentSurface 在 append 当前消息前现取，避免重复当前问题。
+     */
+    historyFor: (options, subject) => {
+      const sessionId =
+        sessionIdOfOptions(options) ?? (typeof subject?.id === 'string' ? subject.id : null)
+      const entry = sessionId === null ? undefined : entries.get(sessionId)
+      return entry === undefined ? [] : historyOfSession(entry.session)
+    },
+    /**
+     * 本次 attempt 应使用的真实会话 cwd。session header 是持久化身份的一部分，
+     * 比某次 followup options 里可能缺失的 meta.cwd 更可靠。
+     */
+    cwdFor: (options, subject) => {
+      const sessionId =
+        sessionIdOfOptions(options) ?? (typeof subject?.id === 'string' ? subject.id : null)
+      const entry = sessionId === null ? undefined : entries.get(sessionId)
+      return typeof entry?.session?.header?.cwd === 'string' ? entry.session.header.cwd : null
+    },
     /** @param {string} sessionId @returns {object|undefined} 宿主条目（测试/证据用） */
     entryOf: (sessionId) => entries.get(sessionId),
     /** @param {string} sessionId @returns {object|undefined} 已绑定的 DSH Session */
@@ -720,6 +883,7 @@ export function createPiSessionHost(config = {}) {  const get = typeof config.ge
         cwd: entry.session.header?.cwd ?? null,
         agentPreset: entry.session.header?.agentPreset ?? null,
         selection: entry.selection ?? null,
+        historyMessages: historyOfSession(entry.session).length,
       })),
     }),
     /**

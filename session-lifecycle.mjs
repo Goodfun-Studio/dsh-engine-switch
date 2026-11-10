@@ -42,13 +42,26 @@
 import { registerHooks } from 'node:module'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+// DSH_WORKSPACE names the host workspace that owns `.recon`; DSH_SWITCH names the
+// plugin checkout under test. They coincide in the normal install layout, but an
+// isolated git worktree is itself the plugin root, so keep the two roots separate.
 const ROOT = process.env.DSH_WORKSPACE || join(__dirname, '..')
+const SWITCH = process.env.DSH_SWITCH || __dirname
 const NM = join(ROOT, '.recon/dsh-src/dsh/node_modules/@deepseek-ai')
-const WS = join(ROOT, 'dsh-engine-switch')
+const WS = SWITCH
 const imp = (p) => import(pathToFileURL(p).href)
 
 // ---------------------------------------------------------------------------
@@ -57,20 +70,80 @@ const imp = (p) => import(pathToFileURL(p).href)
 // ---------------------------------------------------------------------------
 const OAR_STUB_TEXT = 'PI_STUB_TEXT'
 const OAR_STUB = `
+const state = {
+  calls: [],
+  histories: new Map(),
+  failedResumes: new Set(),
+  nextId: 1,
+  activePrompts: 0,
+  maxConcurrentPrompts: 0,
+  promptDelayMs: 0,
+}
+export const oarCalls = state.calls
+export const oarControl = {
+  histories: state.histories,
+  failedResumes: state.failedResumes,
+  activePrompts: () => state.activePrompts,
+  maxConcurrentPrompts: () => state.maxConcurrentPrompts,
+  resetMaxConcurrentPrompts: () => { state.maxConcurrentPrompts = state.activePrompts },
+  setPromptDelay: (ms) => { state.promptDelayMs = ms },
+}
 export const defaultRuntimes = {
   require(id) {
     return { id, installation: async () => ({ kind: 'available' }) }
   },
 }
-export const piSession = async (_installation, options) => ({
-  options,
-  model: () => ({ value: 'magpie/stub-model' }),
-  dispose: async () => {},
-})
-export const promptAndWait = async (_session, text) => ({
-  outcome: { kind: 'completed' },
-  text: text + ' [' + ${JSON.stringify(OAR_STUB_TEXT)} + ']',
-})
+export const piSession = async (_installation, options) => {
+  const call = {
+    options,
+    resume: options.resume ?? null,
+    piSessionId: null,
+    prompt: null,
+    error: null,
+    disposed: false,
+  }
+  state.calls.push(call)
+  if (options.resume !== undefined && state.failedResumes.has(options.resume)) {
+    const error = new Error('pi session ' + options.resume + ' not found')
+    error.name = 'SessionNotFoundError'
+    call.error = error.message
+    throw error
+  }
+  const id = options.resume ?? 'pi-native-' + state.nextId++
+  call.piSessionId = id
+  if (!state.histories.has(id)) state.histories.set(id, [])
+  return {
+    id,
+    call,
+    options,
+    model: () => ({ value: options.model ?? 'magpie/stub-model' }),
+    dispose: async () => { call.disposed = true },
+  }
+}
+export const promptAndWait = async (session, text) => {
+  session.call.prompt = text
+  state.activePrompts += 1
+  state.maxConcurrentPrompts = Math.max(state.maxConcurrentPrompts, state.activePrompts)
+  if (state.promptDelayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, state.promptDelayMs))
+  }
+  const history = state.histories.get(session.id) ?? []
+  let answer = text + ' [' + ${JSON.stringify(OAR_STUB_TEXT)} + ']'
+  if (text.includes('__RECALL__')) {
+    let token = null
+    for (const previous of [...history, text]) {
+      const match = /TOKEN=([A-Z0-9-]+)/.exec(previous)
+      if (match !== null) token = match[1]
+    }
+    answer = 'RECALLED:' + (token ?? 'MISSING') + ' [' + ${JSON.stringify(OAR_STUB_TEXT)} + ']'
+  }
+  history.push(text)
+  state.activePrompts -= 1
+  return {
+    outcome: { kind: 'completed' },
+    text: answer,
+  }
+}
 `
 const OAR_STUB_URL = `data:text/javascript,${encodeURIComponent(OAR_STUB)}`
 
@@ -88,6 +161,7 @@ registerHooks({
   },
 })
 
+const oar = await import('@botiverse/oar')
 const { Context } = await imp(join(NM, 'cordis/lib/index.js'))
 const { AgentRegistry } = await imp(AGENT_ENTRY)
 const { SessionStore } = await imp(join(NM, 'dsh-session/lib/index.js'))
@@ -130,8 +204,30 @@ function createProjections() {
 const tmpRoot = mkdtempSync(join(tmpdir(), 'dsh-session-lifecycle-'))
 const evidenceFile = join(tmpRoot, 'evidence.json')
 const persistenceRoot = join(tmpRoot, 'sessions-root')
+const piAgentDir = join(tmpRoot, 'pi-agent')
+const priorPiAgentDir = process.env.PI_CODING_AGENT_DIR
+process.env.PI_CODING_AGENT_DIR = piAgentDir
+mkdirSync(piAgentDir, { recursive: true })
+writeFileSync(
+  join(piAgentDir, 'models.json'),
+  JSON.stringify({
+    providers: {
+      magpie: {
+        name: 'Magpie',
+        models: [
+          { id: 'auto/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
+          { id: 'auto/claude-fable-5', name: 'Claude Fable 5' },
+        ],
+      },
+    },
+  }),
+)
 const readEvidence = () => JSON.parse(readFileSync(evidenceFile, 'utf8'))
-const cleanup = () => rmSync(tmpRoot, { recursive: true, force: true })
+const cleanup = () => {
+  if (priorPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+  else process.env.PI_CODING_AGENT_DIR = priorPiAgentDir
+  rmSync(tmpRoot, { recursive: true, force: true })
+}
 
 // ---------------------------------------------------------------------------
 // 组装真实组合
@@ -267,13 +363,69 @@ check(
   ctx.agents.get(piAgent.id) === piAgent && piAgent.id === piSession.id,
 )
 
+// L10：建会话时第一次 Pi attempt 打开原生会话，并把 id 按 DSH session 持久化。
+const createOarCall = oar.oarCalls.find(
+  (call) => call.options.cwd === CWD && call.prompt === plug.PI_PROMPT,
+)
+const firstNativePiId = createOarCall?.piSessionId ?? null
+check(
+  'PI_CONTEXT',
+  '首次 Pi attempt 没有 resume（新建原生会话），并返回可复用的 native session id',
+  createOarCall !== undefined &&
+    createOarCall.resume === null &&
+    typeof firstNativePiId === 'string' &&
+    firstNativePiId !== '',
+)
+check(
+  'PI_CONTEXT',
+  '首次 Pi attempt 使用 DSH session 的真实 cwd（不是 desktop profile / process.cwd）',
+  createOarCall?.options?.cwd === CWD,
+)
+check(
+  'PI_CONTEXT',
+  '单轮/首次 attempt 不生成多余历史包装（无 <dsh_conversation_history>，prompt 原样）',
+  createOarCall?.prompt === plug.PI_PROMPT,
+)
+const nativeStoreDir = join(piAgentDir, 'dsh-engine-switch', 'native-sessions')
+const nativeBindingFile =
+  existsSync(nativeStoreDir)
+    ? readdirSync(nativeStoreDir).find((name) => name.endsWith('.json'))
+    : undefined
+const nativeBinding =
+  nativeBindingFile === undefined
+    ? null
+    : JSON.parse(readFileSync(join(nativeStoreDir, nativeBindingFile), 'utf8'))
+check(
+  'PI_CONTEXT',
+  'native session id 按 DSH session 原子持久化（文件里 dshSessionId / piSessionId / cwd 全部一致）',
+  nativeBinding?.version === 1 &&
+    nativeBinding?.dshSessionId === PI_SESSION &&
+    nativeBinding?.piSessionId === firstNativePiId &&
+    nativeBinding?.cwd === CWD,
+)
+const bindingFileFor = (sessionId) => {
+  if (!existsSync(nativeStoreDir)) return null
+  for (const name of readdirSync(nativeStoreDir)) {
+    if (!name.endsWith('.json')) continue
+    const file = join(nativeStoreDir, name)
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      if (parsed?.dshSessionId === sessionId) return file
+    } catch {
+      // 损坏文件由生产代码负责回退；测试 helper 继续找下一个。
+    }
+  }
+  return null
+}
+
 // ---------------------------------------------------------------------------
 // B. 正向：首轮交互（真实 turn 事件 + 流式帧 + whenIdle）
 // ---------------------------------------------------------------------------
 streamFrames.length = 0
+const RECALL_TOKEN = 'CS329Z-L10-ALPHA'
 const rpcId = 'req-l7-first-turn'
 const userMessage = createUserMessage({
-  content: [{ type: 'text', text: '第一轮问题' }],
+  content: [{ type: 'text', text: `第一轮问题 TOKEN=${RECALL_TOKEN}` }],
   source: { kind: 'user', rpcId },
 })
 const seqBefore = piSession.seq
@@ -300,7 +452,9 @@ check(
   'PI_TURN',
   '用户消息真的进了 durable 会话日志（前端会话记录里看得见用户那句话）',
   userEvents.length === 1 &&
-    userEvents[0].data.content.some((block) => block.type === 'text' && block.text === '第一轮问题'),
+    userEvents[0].data.content.some(
+      (block) => block.type === 'text' && block.text === `第一轮问题 TOKEN=${RECALL_TOKEN}`,
+    ),
 )
 check(
   'PI_TURN',
@@ -370,17 +524,290 @@ check(
     typeof streamFrames[0]?.frame?.attemptId === 'string',
 )
 
+const firstTurnOarCall =
+  createOarCall === undefined ? undefined : oar.oarCalls[oar.oarCalls.indexOf(createOarCall) + 1]
+check(
+  'PI_CONTEXT',
+  '首轮用户消息复用建会话时的同一个 Pi native session id（不是再开一个新会话）',
+  firstTurnOarCall?.resume === firstNativePiId &&
+    firstTurnOarCall?.piSessionId === firstNativePiId,
+)
+check(
+  'PI_CONTEXT',
+  '成功 resume 时只把本轮用户文本交给 Pi，不重复注入 DSH 历史',
+  firstTurnOarCall?.prompt === `第一轮问题 TOKEN=${RECALL_TOKEN}`,
+)
+
 // 第二轮：turn 号必须接着走（复用真实 turnBoundary 投影，不能永远 turn=1）
+const SWITCHED_MODEL = 'magpie/auto/claude-fable-5'
+piAgent.model.select({
+  provider: 'magpie',
+  model: 'auto/claude-fable-5',
+  reasoningEffort: 'high',
+})
 const secondTurnSeq = piSession.seq
 piAgent.followup(
-  createUserMessage({ content: [{ type: 'text', text: '第二轮问题' }], source: { kind: 'user', rpcId: 'req-l7-second-turn' } }),
+  createUserMessage({
+    content: [{ type: 'text', text: '请复述第一轮的 TOKEN；__RECALL__' }],
+    source: { kind: 'user', rpcId: 'req-l7-second-turn' },
+  }),
 )
 await piAgent.whenIdle()
 const secondEvents = piSession.snapshotEvents().slice(secondTurnSeq)
+const secondTurnOarCall =
+  firstTurnOarCall === undefined ? undefined : oar.oarCalls[oar.oarCalls.indexOf(firstTurnOarCall) + 1]
+const secondTurnAssistantText = secondEvents
+  .filter((event) => event.type === 'assistant/message')
+  .flatMap((event) => event.data.message.content)
+  .filter((block) => block.type === 'text')
+  .map((block) => block.text)
+  .join('')
 check(
   'PI_TURN',
   '第二轮从真实 turn 边界续号（turn=2），不覆盖/重号（会话可以接着聊）',
   secondEvents.find((event) => event.type === 'turn/start')?.data?.turn === 2,
+)
+check(
+  'PI_CONTEXT',
+  '第二轮继续 resume 同一个 Pi native session id，且改了模型后 resumed attempt 使用新模型',
+  secondTurnOarCall?.resume === firstNativePiId &&
+    secondTurnOarCall?.options?.model === SWITCHED_MODEL &&
+    secondTurnOarCall?.options?.cwd === CWD,
+)
+check(
+  'PI_CONTEXT',
+  '第二轮真实复述第一轮 token（Pi 原生上下文确实跨轮可见）',
+  secondTurnAssistantText.includes(`RECALLED:${RECALL_TOKEN}`),
+)
+
+// 并发/重投负向：DSH 的 session/prompt 不 await agent.followup，客户端重投或下一条
+// 消息可能在前一轮结束前到达。替身必须像 AgentLoop 一样串行，并按 rpcId 合并重投。
+const QUEUE_SESSION = 'session-l10queue01-0000-4000-8000-000000000009'
+const queueAgent = (
+  await ctx.agents.create({
+    sessionId: QUEUE_SESSION,
+    meta: { cwd: CWD, agentPreset: 'standard' },
+    agentOptions: piProfile,
+  })
+)?.agent
+const queueSession = ctx.sessions.get(QUEUE_SESSION)
+const queueCallsBefore = oar.oarCalls.length
+oar.oarControl.setPromptDelay(40)
+oar.oarControl.resetMaxConcurrentPrompts()
+
+const duplicateSeq = queueSession.seq
+const duplicateMessage = createUserMessage({
+  content: [{ type: 'text', text: 'duplicate request must run once; __RECALL__' }],
+  source: { kind: 'user', rpcId: 'req-l10-duplicate-inflight' },
+})
+const duplicateFirst = queueAgent.followup(duplicateMessage)
+const duplicateSecond = queueAgent.followup(
+  createUserMessage({
+    content: duplicateMessage.content,
+    source: duplicateMessage.source,
+  }),
+)
+const duplicateQueuedVisible =
+  queueAgent.inbox.nextTurn.length === 1 &&
+  queueAgent.inbox.nextTurn[0]?.source?.rpcId === 'req-l10-duplicate-inflight'
+await Promise.all([duplicateFirst, duplicateSecond])
+await queueAgent.whenIdle()
+await ctx.sessions.flush(queueSession)
+const duplicateEvents = queueSession.snapshotEvents().slice(duplicateSeq)
+const duplicateCalls = oar.oarCalls.slice(queueCallsBefore)
+check(
+  'PI_QUEUE',
+  '同一 rpcId 的同步重投返回同一个 promise，并且只产生一个等待项（DSH hasPromptRequest 也能看见）',
+  duplicateFirst === duplicateSecond && duplicateQueuedVisible,
+)
+check(
+  'PI_QUEUE',
+  '同一 rpcId 的 in-flight 重投只打开一个 Pi attempt、只落一条 user/assistant/turn',
+  duplicateCalls.length === 1 &&
+    duplicateEvents.filter((event) => event.type === 'user/message').length === 1 &&
+    duplicateEvents.filter((event) => event.type === 'assistant/message').length === 1 &&
+    duplicateEvents.filter((event) => event.type === 'turn/start').length === 1 &&
+    duplicateEvents.filter((event) => event.type === 'turn/end').length === 1,
+)
+
+const serialSeq = queueSession.seq
+const serialCallsBefore = oar.oarCalls.length
+oar.oarControl.resetMaxConcurrentPrompts()
+const serialFirst = queueAgent.followup(
+  createUserMessage({
+    content: [{ type: 'text', text: 'serial request A; __RECALL__' }],
+    source: { kind: 'user', rpcId: 'req-l10-serial-a' },
+  }),
+)
+const serialSecond = queueAgent.followup(
+  createUserMessage({
+    content: [{ type: 'text', text: 'serial request B; __RECALL__' }],
+    source: { kind: 'user', rpcId: 'req-l10-serial-b' },
+  }),
+)
+const distinctQueuedVisible = queueAgent.inbox.nextTurn.length === 2
+await Promise.all([serialFirst, serialSecond])
+await queueAgent.whenIdle()
+await ctx.sessions.flush(queueSession)
+const serialEvents = queueSession.snapshotEvents().slice(serialSeq)
+const serialCalls = oar.oarCalls.slice(serialCallsBefore)
+check(
+  'PI_QUEUE',
+  '两个不同 rpcId 同时到达时都进入队列，不丢请求',
+  distinctQueuedVisible &&
+    serialEvents.filter((event) => event.type === 'user/message').length === 2 &&
+    serialEvents.filter((event) => event.type === 'assistant/message').length === 2,
+)
+check(
+  'PI_QUEUE',
+  '同一 DSH session 的 Pi attempt 严格串行（最大并发=1），没有两个 embedded Pi session 争用进程状态',
+  serialCalls.length === 2 &&
+    oar.oarControl.maxConcurrentPrompts() === 1 &&
+    oar.oarControl.activePrompts() === 0 &&
+    queueAgent.status === 'idle',
+)
+oar.oarControl.setPromptDelay(0)
+
+// 旧会话没有 native id：删掉绑定后，下一轮必须用 DSH 历史 Bootstrap，而不是失忆。
+const OLD_SESSION = 'session-l10old001-0000-4000-8000-000000000010'
+const OLD_TOKEN = 'CS329Z-L10-OLD'
+const oldStartIndex = oar.oarCalls.length
+const oldAgent = (
+  await ctx.agents.create({
+    sessionId: OLD_SESSION,
+    meta: { cwd: CWD, agentPreset: 'standard' },
+    agentOptions: piProfile,
+  })
+)?.agent
+await oldAgent.followup(
+  createUserMessage({
+    content: [{ type: 'text', text: `旧会话第一轮 TOKEN=${OLD_TOKEN}` }],
+    source: { kind: 'user', rpcId: 'req-l10-old-first' },
+  }),
+)
+await oldAgent.whenIdle()
+const oldFirstCall = oar.oarCalls[oldStartIndex + 1]
+const oldNativeId = oldFirstCall?.piSessionId
+const oldBindingFile = bindingFileFor(OLD_SESSION)
+const oldBindingRemoved = oldBindingFile !== null
+if (oldBindingFile !== null) unlinkSync(oldBindingFile)
+const oldSecondSeq = oldAgent.session.seq
+const OLD_CURRENT = '请回答旧会话下一轮的问题；__RECALL__'
+await oldAgent.followup(
+  createUserMessage({
+    content: [{ type: 'text', text: OLD_CURRENT }],
+    source: { kind: 'user', rpcId: 'req-l10-old-second' },
+  }),
+)
+await oldAgent.whenIdle()
+const oldSecondCall = oar.oarCalls[oldStartIndex + 2]
+const oldAssistantText = oldAgent.session
+  .snapshotEvents()
+  .slice(oldSecondSeq)
+  .filter((event) => event.type === 'assistant/message')
+  .flatMap((event) => event.data.message.content)
+  .filter((block) => block.type === 'text')
+  .map((block) => block.text)
+  .join('')
+const oldRepersisted = bindingFileFor(OLD_SESSION)
+check(
+  'PI_CONTEXT',
+  '旧 DSH 会话绑定丢失时不复用错误/游离 id，而是新开 Pi 会话并注入历史',
+  oldBindingRemoved === true &&
+    oldSecondCall?.resume === null &&
+    typeof oldSecondCall?.piSessionId === 'string' &&
+    oldSecondCall.piSessionId !== oldNativeId,
+)
+check(
+  'PI_CONTEXT',
+  '旧会话 Bootstrap 同时包含前序 User + Assistant 与当前问题，当前问题只出现一次',
+  typeof oldSecondCall?.prompt === 'string' &&
+    oldSecondCall.prompt.includes('<dsh_conversation_history>') &&
+    oldSecondCall.prompt.includes(`User:\n旧会话第一轮 TOKEN=${OLD_TOKEN}`) &&
+    oldSecondCall.prompt.includes('Assistant:') &&
+    oldSecondCall.prompt.includes(OAR_STUB_TEXT) &&
+    oldSecondCall.prompt.split(OLD_CURRENT).length - 1 === 1,
+)
+check(
+  'PI_CONTEXT',
+  '旧会话 Bootstrap 后真的能回忆前轮 token，并写回 assistant/message',
+  oldAssistantText.includes(`RECALLED:${OLD_TOKEN}`),
+)
+check(
+  'PI_CONTEXT',
+  '旧会话 Bootstrap 打开的新 native id 已重新持久化，下一轮又能走 resume',
+  oldRepersisted !== null &&
+    JSON.parse(readFileSync(oldRepersisted, 'utf8')).piSessionId === oldSecondCall?.piSessionId,
+)
+
+// resume 失败（SessionNotFound）：同样必须回退到新会话 + 历史，不得静默失忆。
+const FALLBACK_SESSION = 'session-l10fall001-0000-4000-8000-000000000011'
+const FALLBACK_TOKEN = 'CS329Z-L10-FALLBACK'
+const fallbackStartIndex = oar.oarCalls.length
+const fallbackAgent = (
+  await ctx.agents.create({
+    sessionId: FALLBACK_SESSION,
+    meta: { cwd: CWD, agentPreset: 'standard' },
+    agentOptions: piProfile,
+  })
+)?.agent
+await fallbackAgent.followup(
+  createUserMessage({
+    content: [{ type: 'text', text: `resume 前一轮 TOKEN=${FALLBACK_TOKEN}` }],
+    source: { kind: 'user', rpcId: 'req-l10-fallback-first' },
+  }),
+)
+await fallbackAgent.whenIdle()
+const fallbackFirstCall = oar.oarCalls[fallbackStartIndex + 1]
+const fallbackNativeId = fallbackFirstCall?.piSessionId
+oar.oarControl.failedResumes.add(fallbackNativeId)
+const fallbackSecondSeq = fallbackAgent.session.seq
+const FALLBACK_CURRENT = 'resume 失败后仍请回忆；__RECALL__'
+await fallbackAgent.followup(
+  createUserMessage({
+    content: [{ type: 'text', text: FALLBACK_CURRENT }],
+    source: { kind: 'user', rpcId: 'req-l10-fallback-second' },
+  }),
+)
+await fallbackAgent.whenIdle()
+const failedResumeCall = oar.oarCalls[fallbackStartIndex + 2]
+const fallbackNewCall = oar.oarCalls[fallbackStartIndex + 3]
+const fallbackAssistantText = fallbackAgent.session
+  .snapshotEvents()
+  .slice(fallbackSecondSeq)
+  .filter((event) => event.type === 'assistant/message')
+  .flatMap((event) => event.data.message.content)
+  .filter((block) => block.type === 'text')
+  .map((block) => block.text)
+  .join('')
+const fallbackBindingFile = bindingFileFor(FALLBACK_SESSION)
+const fallbackBinding =
+  fallbackBindingFile === null ? null : JSON.parse(readFileSync(fallbackBindingFile, 'utf8'))
+check(
+  'PI_CONTEXT',
+  'Pi resume 返回 SessionNotFound 后自动回退新会话，并在证据里如实记录 resume-failed',
+  failedResumeCall?.resume === fallbackNativeId &&
+    failedResumeCall?.error?.includes('not found') === true &&
+    fallbackNewCall?.resume === null &&
+    readEvidence().modelAttempt?.nativeSessionFallback === 'resume-failed' &&
+    readEvidence().modelAttempt?.nativeSessionFallbackError?.includes('not found') === true &&
+    readEvidence().piContinuityAttempt?.mode === 'bootstrap' &&
+    readEvidence().piContinuityAttempt?.fallbackReason?.includes('not found') === true,
+)
+check(
+  'PI_CONTEXT',
+  'resume 失败回退的 Bootstrap 含前序 user/assistant 与本轮问题一次，且 token 真被回忆',
+  fallbackNewCall?.prompt?.includes('<dsh_conversation_history>') === true &&
+    fallbackNewCall.prompt.includes(`TOKEN=${FALLBACK_TOKEN}`) &&
+    fallbackNewCall.prompt.includes(OAR_STUB_TEXT) &&
+    fallbackNewCall.prompt.split(FALLBACK_CURRENT).length - 1 === 1 &&
+    fallbackAssistantText.includes(`RECALLED:${FALLBACK_TOKEN}`),
+)
+check(
+  'PI_CONTEXT',
+  'resume 失败后坏绑定被替换成新 native id（不是保留失效 id 让下一轮继续炸）',
+  fallbackBinding?.piSessionId === fallbackNewCall?.piSessionId &&
+    fallbackNewCall?.piSessionId !== fallbackNativeId,
 )
 
 const persistedTurnText = await (async () => {
@@ -479,8 +906,11 @@ check(
 )
 check(
   'NEG_NATIVE',
-  '原生路径不注册任何 Agent（注册表里只有正向 pi 的那一个替身）',
-  ctx.agents.list().filter((agent) => agent.standIn === true).length === 1 &&
+  '原生路径不注册 Agent（注册表里的 standIn 全属于正向 pi 会话；native 两个会话都查不到）',
+  ctx.agents
+    .list()
+    .filter((agent) => agent.standIn === true)
+    .every((agent) => !String(agent.id).startsWith('session-l7nat')) &&
     ctx.agents.get(NATIVE_SESSION) === undefined,
 )
 
@@ -536,6 +966,7 @@ await tick(150)
 
 const resumedCreated = await world2.agents.resume({ resumeSessionId: PI_SESSION })
 const resumedAgent = resumedCreated?.agent
+const coldResumeOarCall = oar.oarCalls.at(-1)
 const resumedSession = world2.sessions.get(PI_SESSION)
 const resumedEvents = resumedSession === undefined ? [] : resumedSession.snapshotEvents()
 const resumedText = resumedEvents
@@ -565,12 +996,21 @@ check(
   '冷重启后 Agent 注册进新进程的 ctx.agents（重启后旧会话能继续对话的前提）',
   world2.agents.get(PI_SESSION) === resumedAgent,
 )
+check(
+  'PI_CONTEXT',
+  '宿主冷重启后仍从持久绑定找回同一个 Pi native session id（不是只靠进程内 Map）',
+  coldResumeOarCall?.resume === firstNativePiId &&
+    coldResumeOarCall?.piSessionId === firstNativePiId,
+)
 
 // 冷开之后接着聊：turn 号必须接在磁盘历史之后，且事件必须能落盘
 // （真机踩过的坑：seq 与持久化游标错位 → append seq mismatch）
 const resumeSeqBefore = resumedSession.seq
 resumedAgent.followup(
-  createUserMessage({ content: [{ type: 'text', text: '重启后的第二轮' }], source: { kind: 'user', rpcId: 'req-l7-resume-turn' } }),
+  createUserMessage({
+    content: [{ type: 'text', text: '重启后请复述第一轮 TOKEN；__RECALL__' }],
+    source: { kind: 'user', rpcId: 'req-l7-resume-turn' },
+  }),
 )
 let resumeTurnError = null
 try {
@@ -579,6 +1019,12 @@ try {
   resumeTurnError = String(error?.message ?? error)
 }
 const resumeEvents2 = resumedSession.snapshotEvents().slice(resumeSeqBefore)
+const resumeAssistantText = resumeEvents2
+  .filter((event) => event.type === 'assistant/message')
+  .flatMap((event) => event.data.message.content)
+  .filter((block) => block.type === 'text')
+  .map((block) => block.text)
+  .join('')
 check(
   'RESUME',
   '冷重启后接续的一轮真的落盘：无 flush/seq 错位错误（持久化游标与会话 seq 对齐）',
@@ -592,6 +1038,21 @@ check(
   'RESUME',
   `冷重启后 turn 号接在磁盘历史之后（历史最大 turn=${seededMaxTurn} → 新一轮 turn=${String(resumedTurn)}），不重号不覆盖`,
   resumedTurn === seededMaxTurn + 1,
+)
+check(
+  'PI_CONTEXT',
+  '冷重启后的续聊仍能复述最初 token（Pi 原生会话通过持久 id 真接上，不是只把 DSH 两轮事件堆起来）',
+  resumeAssistantText.includes(`RECALLED:${RECALL_TOKEN}`),
+)
+const cumulativeContinuity = readEvidence().piContinuity
+check(
+  'PI_CONTEXT',
+  'resume 失效信号按类型累计保留：后续恢复正常 resume 不会把此前 fallback 覆盖掉',
+  cumulativeContinuity?.attempts >= 10 &&
+    cumulativeContinuity?.modeCounts?.resume >= 5 &&
+    cumulativeContinuity?.modeCounts?.bootstrap >= 2 &&
+    cumulativeContinuity?.fallbackCounts?.['binding-missing'] >= 1 &&
+    cumulativeContinuity?.fallbackCounts?.['resume-failed'] >= 1,
 )
 const resumedDiskText = await (async () => {
   try {
@@ -626,7 +1087,7 @@ cleanup()
 
 console.log(`\nSUMMARY: ${pass} HIT / ${fail} MISS`)
 console.log(
-  'ASSERTION_CLASSES: PI_IDENTITY, PI_SESSION, PI_PERSIST, PI_REGISTRY, PI_STREAM, PI_TURN, NEG_NATIVE, RESUME, UNLOAD',
+  'ASSERTION_CLASSES: PI_IDENTITY, PI_SESSION, PI_PERSIST, PI_REGISTRY, PI_STREAM, PI_TURN, PI_CONTEXT, NEG_NATIVE, RESUME, UNLOAD',
 )
 console.log(fail === 0 ? 'RESULT: PASS' : 'RESULT: FAIL')
 process.exit(fail === 0 ? 0 : 1)
